@@ -1,0 +1,11 @@
+# Local databases and SQLite side files.
+*.db
+*.db-shm
+*.db-wal
+
+# Local build outputs.
+/once
+/once.exe
+
+# OS/editor noise.
+.DS_Store

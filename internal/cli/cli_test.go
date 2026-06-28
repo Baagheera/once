@@ -1,0 +1,131 @@
+package cli
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+
+	once "github.com/Baagheera/once/internal/once"
+)
+
+func TestRunReplaysSavedResult(t *testing.T) {
+	store := filepath.Join(t.TempDir(), "once.db")
+
+	var out1, err1 bytes.Buffer
+	code := Run([]string{"--store", store, "run", "--key", "demo", "--", shell(), shellFlag(), "echo first"}, &out1, &err1)
+	if code != 0 {
+		t.Fatalf("first run code = %d stderr = %s", code, err1.String())
+	}
+	if strings.TrimSpace(out1.String()) != "first" {
+		t.Fatalf("first stdout = %q", out1.String())
+	}
+
+	var out2, err2 bytes.Buffer
+	code = Run([]string{"--store", store, "run", "--key", "demo", "--", shell(), shellFlag(), "echo second"}, &out2, &err2)
+	if code != 0 {
+		t.Fatalf("second run code = %d stderr = %s", code, err2.String())
+	}
+	if strings.TrimSpace(out2.String()) != "first" {
+		t.Fatalf("second stdout = %q", out2.String())
+	}
+}
+
+func TestStatus(t *testing.T) {
+	store := filepath.Join(t.TempDir(), "once.db")
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", store, "run", "--key", "demo", "--", shell(), shellFlag(), "echo ok"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("run code = %d stderr = %s", code, errOut.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"--store", store, "status", "demo"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("status code = %d stderr = %s", code, errOut.String())
+	}
+	if strings.TrimSpace(out.String()) != "succeeded" {
+		t.Fatalf("status stdout = %q", out.String())
+	}
+}
+
+func TestRunReplaysSavedFailure(t *testing.T) {
+	store := filepath.Join(t.TempDir(), "once.db")
+
+	var out1, err1 bytes.Buffer
+	code := Run([]string{"--store", store, "run", "--key", "demo", "--", shell(), shellFlag(), failScript()}, &out1, &err1)
+	if code != 9 {
+		t.Fatalf("first run code = %d stderr = %s", code, err1.String())
+	}
+
+	var out2, err2 bytes.Buffer
+	code = Run([]string{"--store", store, "run", "--key", "demo", "--", shell(), shellFlag(), "echo good"}, &out2, &err2)
+	if code != 9 {
+		t.Fatalf("second run code = %d stderr = %s", code, err2.String())
+	}
+	if strings.TrimSpace(out2.String()) != "bad" {
+		t.Fatalf("second stdout = %q", out2.String())
+	}
+}
+
+func TestRunRejectsRunningKey(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Reserve("demo", []string{"still", "running"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "run", "--key", "demo", "--", shell(), shellFlag(), "echo no"}, &out, &errOut)
+	if code != 75 {
+		t.Fatalf("run code = %d stderr = %s", code, errOut.String())
+	}
+	if out.Len() != 0 {
+		t.Fatalf("stdout = %q", out.String())
+	}
+	if !strings.Contains(errOut.String(), "already running") {
+		t.Fatalf("stderr = %q", errOut.String())
+	}
+}
+
+func TestStoreWithoutCommandDoesNotPanic(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", filepath.Join(t.TempDir(), "once.db")}, &out, &errOut)
+	if code != 2 {
+		t.Fatalf("code = %d", code)
+	}
+}
+
+func shell() string {
+	if runtime.GOOS == "windows" {
+		if comspec := os.Getenv("ComSpec"); comspec != "" {
+			return comspec
+		}
+		return "cmd"
+	}
+	return "sh"
+}
+
+func shellFlag() string {
+	if runtime.GOOS == "windows" {
+		return "/C"
+	}
+	return "-c"
+}
+
+func failScript() string {
+	if runtime.GOOS == "windows" {
+		return "echo bad && exit /b 9"
+	}
+	return "echo bad; exit 9"
+}
