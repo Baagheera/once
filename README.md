@@ -14,6 +14,9 @@ The first command runs the program and stores its result. The second command
 does not run it again. It prints the saved stdout and stderr, and exits with
 the saved exit code.
 
+If the same key is reused with a different command, once returns an error. A
+key should name one operation, not a family of similar operations.
+
 ## What it is
 
 once is an idempotency log for commands that perform side effects. Give an
@@ -84,9 +87,10 @@ becomes a record you can inspect.
 
 ```sh
 once run --key KEY -- COMMAND [ARG...]
+once serve [--listen ADDR]
 once status KEY
 once get KEY
-once forget KEY
+once forget [--force] KEY
 ```
 
 Global flags:
@@ -94,6 +98,42 @@ Global flags:
 ```sh
 --store PATH    SQLite database path. Default: once.db
 ```
+
+## HTTP mode
+
+`once serve` exposes the same ledger over HTTP:
+
+```sh
+once serve --listen 127.0.0.1:7410
+```
+
+Reserve a key:
+
+```sh
+curl -s http://127.0.0.1:7410/v1/reserve \
+  -H 'content-type: application/json' \
+  -d '{"key":"webhook:event-123","command":["send-webhook"]}'
+```
+
+Commit the result:
+
+```sh
+curl -s http://127.0.0.1:7410/v1/commit \
+  -H 'content-type: application/json' \
+  -d '{"key":"webhook:event-123","state":"succeeded","exit_code":0,"stdout_b64":"b2sK"}'
+```
+
+Fetch the record:
+
+```sh
+curl -s http://127.0.0.1:7410/v1/records/webhook:event-123
+```
+
+Byte fields such as `stdout_b64` and `stderr_b64` are JSON base64 strings. The HTTP
+server does not run commands; it only stores and returns idempotency records.
+
+Deleting a `running` record requires `--force` in the CLI or `?force=1` in the
+HTTP API.
 
 ## Non-goals
 

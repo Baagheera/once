@@ -1,6 +1,8 @@
 package once
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -53,7 +55,11 @@ func TestForget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ok, err := store.Forget("k1")
+	if _, err := store.Commit("k1", Succeeded, 0, nil, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	ok, err := store.Forget("k1", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,5 +69,112 @@ func TestForget(t *testing.T) {
 
 	if _, err := store.Get("k1"); err != ErrNotFound {
 		t.Fatalf("Get err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestReserveRejectsDifferentCommand(t *testing.T) {
+	store, err := OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if _, _, err := store.Reserve("k1", []string{"echo", "one"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit("k1", Succeeded, 0, []byte("one\n"), nil, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := store.Reserve("k1", []string{"echo", "two"}); err != ErrConflict {
+		t.Fatalf("Reserve err = %v, want ErrConflict", err)
+	}
+}
+
+func TestCommitIsIdempotentForSameResult(t *testing.T) {
+	store, err := OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if _, _, err := store.Reserve("k1", []string{"echo", "one"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit("k1", Succeeded, 0, []byte("one\n"), nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := store.Commit("k1", Succeeded, 0, []byte("one\n"), nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != Succeeded {
+		t.Fatalf("state = %s", rec.State)
+	}
+}
+
+func TestCommitConflictsForDifferentResult(t *testing.T) {
+	store, err := OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if _, _, err := store.Reserve("k1", []string{"echo", "one"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit("k1", Succeeded, 0, []byte("one\n"), nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit("k1", Succeeded, 0, []byte("two\n"), nil, ""); err != ErrConflict {
+		t.Fatalf("Commit err = %v, want ErrConflict", err)
+	}
+}
+
+func TestForgetRunningNeedsForce(t *testing.T) {
+	store, err := OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if _, _, err := store.Reserve("k1", []string{"true"}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := store.Forget("k1", false); err != ErrRunning || ok {
+		t.Fatalf("Forget ok=%v err=%v, want ErrRunning", ok, err)
+	}
+	if ok, err := store.Forget("k1", true); err != nil || !ok {
+		t.Fatalf("Forget force ok=%v err=%v", ok, err)
+	}
+}
+
+func TestConcurrentReserveOnlyOneFresh(t *testing.T) {
+	store, err := OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var freshCount int64
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, fresh, err := store.Reserve("k1", []string{"true"})
+			if err != nil {
+				t.Errorf("Reserve err = %v", err)
+				return
+			}
+			if fresh {
+				atomic.AddInt64(&freshCount, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if freshCount != 1 {
+		t.Fatalf("freshCount = %d, want 1", freshCount)
 	}
 }

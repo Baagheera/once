@@ -7,11 +7,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os/exec"
 	"strings"
 	"time"
 
 	once "github.com/Baagheera/once/internal/once"
+	"github.com/Baagheera/once/internal/server"
 )
 
 const defaultStorePath = "once.db"
@@ -39,6 +41,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "run":
 		return runCommand(args[1:], storePath, stdout, stderr)
+	case "serve":
+		return serveCommand(args[1:], storePath, stdout, stderr)
 	case "status":
 		return statusCommand(args[1:], storePath, stdout, stderr)
 	case "get":
@@ -80,6 +84,10 @@ func runCommand(args []string, storePath string, stdout, stderr io.Writer) int {
 	defer store.Close()
 
 	rec, fresh, err := store.Reserve(*key, command)
+	if errors.Is(err, once.ErrConflict) {
+		fmt.Fprintf(stderr, "once: key already exists with a different command: %s\n", *key)
+		return 1
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "once: reserve: %v\n", err)
 		return 1
@@ -102,6 +110,33 @@ func runCommand(args []string, storePath string, stdout, stderr io.Writer) int {
 	}
 
 	return replayRecord(rec, stdout, stderr)
+}
+
+func serveCommand(args []string, storePath string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	listen := fs.String("listen", "127.0.0.1:7410", "listen address")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "once: serve does not take positional arguments")
+		return 2
+	}
+
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		fmt.Fprintf(stderr, "once: open store: %v\n", err)
+		return 1
+	}
+	defer store.Close()
+
+	fmt.Fprintf(stdout, "once: listening on %s\n", *listen)
+	if err := http.ListenAndServe(*listen, server.NewHandler(store)); err != nil {
+		fmt.Fprintf(stderr, "once: serve: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 func statusCommand(args []string, storePath string, stdout, stderr io.Writer) int {
@@ -161,10 +196,17 @@ func getCommand(args []string, storePath string, stdout, stderr io.Writer) int {
 }
 
 func forgetCommand(args []string, storePath string, stdout, stderr io.Writer) int {
-	if len(args) != 1 {
+	fs := flag.NewFlagSet("forget", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	force := fs.Bool("force", false, "delete even if the key is still running")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 1 {
 		fmt.Fprintln(stderr, "once: forget needs exactly one key")
 		return 2
 	}
+	key := fs.Arg(0)
 
 	store, err := once.OpenSQLite(storePath)
 	if err != nil {
@@ -173,13 +215,17 @@ func forgetCommand(args []string, storePath string, stdout, stderr io.Writer) in
 	}
 	defer store.Close()
 
-	ok, err := store.Forget(args[0])
+	ok, err := store.Forget(key, *force)
+	if errors.Is(err, once.ErrRunning) {
+		fmt.Fprintf(stderr, "once: key is still running: %s\n", key)
+		return 1
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "once: forget: %v\n", err)
 		return 1
 	}
 	if !ok {
-		fmt.Fprintf(stderr, "once: key not found: %s\n", args[0])
+		fmt.Fprintf(stderr, "once: key not found: %s\n", key)
 		return 1
 	}
 	fmt.Fprintln(stdout, "forgot")
@@ -244,9 +290,10 @@ func usage(w io.Writer) {
 	lines := []string{
 		"usage:",
 		"  once [--store PATH] run --key KEY -- COMMAND [ARG...]",
+		"  once [--store PATH] serve [--listen ADDR]",
 		"  once [--store PATH] status KEY",
 		"  once [--store PATH] get KEY",
-		"  once [--store PATH] forget KEY",
+		"  once [--store PATH] forget [--force] KEY",
 	}
 	fmt.Fprintln(w, strings.Join(lines, "\n"))
 }

@@ -1,6 +1,7 @@
 package once
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -105,6 +106,9 @@ VALUES
 	if err != nil {
 		return Record{}, false, err
 	}
+	if affected == 0 && len(command) != 0 && len(rec.Command) != 0 && !sameCommand(rec.Command, command) {
+		return rec, false, ErrConflict
+	}
 	return rec, affected == 1, nil
 }
 
@@ -140,7 +144,20 @@ WHERE key = ? AND state = 'running'
 		return Record{}, err
 	}
 	if affected == 0 {
-		return Record{}, ErrNotFound
+		rec, err := s.Get(key)
+		if errors.Is(err, ErrNotFound) {
+			return Record{}, ErrNotFound
+		}
+		if err != nil {
+			return Record{}, err
+		}
+		if rec.State == Running {
+			return Record{}, ErrConflict
+		}
+		if sameResult(rec, state, exitCode, stdout, stderr, runErr) {
+			return rec, nil
+		}
+		return Record{}, ErrConflict
 	}
 
 	return s.Get(key)
@@ -200,7 +217,20 @@ WHERE key = ?
 	return rec, nil
 }
 
-func (s *SQLiteStore) Forget(key string) (bool, error) {
+func (s *SQLiteStore) Forget(key string, force bool) (bool, error) {
+	if !force {
+		rec, err := s.Get(key)
+		if errors.Is(err, ErrNotFound) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if rec.State == Running {
+			return false, ErrRunning
+		}
+	}
+
 	res, err := s.db.Exec(`DELETE FROM once_records WHERE key = ?`, key)
 	if err != nil {
 		return false, err
@@ -218,4 +248,24 @@ func formatTime(t time.Time) string {
 
 func parseTime(s string) (time.Time, error) {
 	return time.Parse(time.RFC3339Nano, s)
+}
+
+func sameCommand(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameResult(rec Record, state State, exitCode int, stdout, stderr []byte, runErr string) bool {
+	return rec.State == state &&
+		rec.ExitCode == exitCode &&
+		bytes.Equal(rec.Stdout, stdout) &&
+		bytes.Equal(rec.Stderr, stderr) &&
+		rec.Error == runErr
 }
