@@ -181,6 +181,60 @@ func TestServeRejectsUnsafeNoAuthOnRemote(t *testing.T) {
 	}
 }
 
+func TestServeRejectsWeakToken(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", filepath.Join(t.TempDir(), "once.db"), "serve", "--token", "short"}, &out, &errOut)
+	if code != 2 {
+		t.Fatalf("code = %d", code)
+	}
+	if strings.Contains(out.String(), "short") {
+		t.Fatalf("stdout leaked token: %q", out.String())
+	}
+	if !strings.Contains(errOut.String(), "at least 32 characters") {
+		t.Fatalf("stderr = %q", errOut.String())
+	}
+}
+
+func TestResolveAuthTokenCreatesTokenFile(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+
+	token, tokenFile, err := resolveAuthToken("", "", false, storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token == "" {
+		t.Fatal("missing generated token")
+	}
+	if tokenFile != storePath+".token" {
+		t.Fatalf("tokenFile = %q", tokenFile)
+	}
+	data, err := os.ReadFile(tokenFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(data)) != token {
+		t.Fatal("token file does not contain generated token")
+	}
+}
+
+func TestResolveAuthTokenRejectsTokenFileSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires privileges on some Windows installs")
+	}
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	link := filepath.Join(dir, "token")
+	if err := os.WriteFile(target, []byte(strings.Repeat("a", minAuthTokenLength)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := resolveAuthToken("", link, false, filepath.Join(dir, "once.db")); err == nil {
+		t.Fatal("expected symlink token file to be rejected")
+	}
+}
+
 func shell() string {
 	if runtime.GOOS == "windows" {
 		if comspec := os.Getenv("ComSpec"); comspec != "" {

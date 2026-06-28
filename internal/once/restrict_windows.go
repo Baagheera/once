@@ -1,0 +1,52 @@
+//go:build windows
+
+package once
+
+import (
+	"fmt"
+
+	"golang.org/x/sys/windows"
+)
+
+func restrictLocalFile(path string) error {
+	token, err := windows.OpenCurrentProcessToken()
+	if err != nil {
+		return fmt.Errorf("open process token: %w", err)
+	}
+	defer token.Close()
+
+	user, err := token.GetTokenUser()
+	if err != nil {
+		return fmt.Errorf("get token user: %w", err)
+	}
+
+	acl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{
+		{
+			AccessPermissions: windows.GENERIC_ALL,
+			AccessMode:        windows.GRANT_ACCESS,
+			Inheritance:       windows.NO_INHERITANCE,
+			Trustee: windows.TRUSTEE{
+				TrusteeForm:  windows.TRUSTEE_IS_SID,
+				TrusteeType:  windows.TRUSTEE_IS_USER,
+				TrusteeValue: windows.TrusteeValueFromSID(user.User.Sid),
+			},
+		},
+	}, nil)
+	if err != nil {
+		return fmt.Errorf("build acl: %w", err)
+	}
+
+	err = windows.SetNamedSecurityInfo(
+		path,
+		windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil,
+		nil,
+		acl,
+		nil,
+	)
+	if err != nil {
+		return fmt.Errorf("set acl: %w", err)
+	}
+	return nil
+}

@@ -1,6 +1,7 @@
 package once
 
 import (
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -60,7 +61,7 @@ func TestForget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ok, err := store.Forget("k1", false, "")
+	ok, err := store.Forget("k1", false, rec.Attempt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,11 +185,44 @@ func TestForgetRunningNeedsForce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := store.Forget("k1", false, ""); err != ErrRunning || ok {
+	if ok, err := store.Forget("k1", false, ""); err == nil || ok {
+		t.Fatalf("Forget ok=%v err=%v, want invalid attempt", ok, err)
+	}
+	if ok, err := store.Forget("k1", false, rec.Attempt); err != ErrRunning || ok {
 		t.Fatalf("Forget ok=%v err=%v, want ErrRunning", ok, err)
 	}
 	if ok, err := store.Forget("k1", true, rec.Attempt); err != nil || !ok {
 		t.Fatalf("Forget force ok=%v err=%v", ok, err)
+	}
+}
+
+func TestForgetRequiresAttempt(t *testing.T) {
+	store, err := OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if _, _, err := store.Reserve("k1", []string{"true"}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := store.Forget("k1", true, ""); err == nil || ok {
+		t.Fatalf("Forget ok=%v err=%v, want missing attempt error", ok, err)
+	}
+}
+
+func TestAdminForgetDoesNotNeedAttempt(t *testing.T) {
+	store, err := OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if _, _, err := store.Reserve("k1", []string{"true"}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := store.AdminForget("k1", true); err != nil || !ok {
+		t.Fatalf("AdminForget ok=%v err=%v", ok, err)
 	}
 }
 
@@ -238,5 +272,24 @@ func TestConcurrentReserveOnlyOneFresh(t *testing.T) {
 
 	if freshCount != 1 {
 		t.Fatalf("freshCount = %d, want 1", freshCount)
+	}
+}
+
+func TestOpenSQLiteRejectsURIStylePaths(t *testing.T) {
+	tests := []string{
+		":memory:",
+		filepath.Join("x", "..", ":memory:"),
+		"file:" + filepath.Join(t.TempDir(), "once.db") + "?mode=rwc",
+		filepath.Join("x", "..", "file:"+filepath.Join(t.TempDir(), "once.db")),
+		filepath.Join(t.TempDir(), "once.db?mode=memory"),
+	}
+	for _, path := range tests {
+		t.Run(path, func(t *testing.T) {
+			store, err := OpenSQLite(path)
+			if err == nil {
+				_ = store.Close()
+				t.Fatalf("OpenSQLite(%q) succeeded, want error", path)
+			}
+		})
 	}
 }

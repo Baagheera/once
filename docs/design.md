@@ -15,6 +15,11 @@ only as a hash and is required to commit the result. This prevents a different
 client that merely knows the key from finalizing someone else's in-flight
 operation.
 
+HTTP delete uses the same token binding. Deleting a record over HTTP requires
+the reservation token, and deleting a `running` record additionally requires an
+explicit force flag. The CLI has a separate administrative forget path for local
+operators who already have direct access to the SQLite file.
+
 The hard case is a process that dies after the side effect happened but before
 the row is committed. once does not guess. The row remains `running`.
 
@@ -43,4 +48,6 @@ result. A repeated commit with different output, state or exit code is a
 conflict.
 
 HTTP mode requires bearer authentication by default. The default listener is
-loopback, and non-loopback listeners require `--allow-remote`.
+loopback, and non-loopback listeners require `--allow-remote`. If no token is
+provided, the CLI creates a local token file instead of printing the secret to
+the terminal.
