@@ -2,7 +2,7 @@
 set -eu
 
 addr="${ONCE_ADDR:-127.0.0.1:7410}"
-token="${ONCE_TOKEN:-secret}"
+token="${ONCE_TOKEN:?set ONCE_TOKEN to the bearer token}"
 
 reserve_response="$(curl -s "http://$addr/v1/reserve" \
   -H "authorization: Bearer $token" \
@@ -11,6 +11,10 @@ reserve_response="$(curl -s "http://$addr/v1/reserve" \
 printf '%s\n' "$reserve_response"
 
 attempt_token="$(printf '%s\n' "$reserve_response" | sed -n 's/.*"attempt_token":"\([^"]*\)".*/\1/p')"
+if [ -z "$attempt_token" ]; then
+  echo "reserve did not return attempt_token" >&2
+  exit 1
+fi
 
 curl -s "http://$addr/v1/commit" \
   -H "authorization: Bearer $token" \

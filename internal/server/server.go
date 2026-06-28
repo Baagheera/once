@@ -4,7 +4,6 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"mime"
 	"net/http"
@@ -170,13 +169,10 @@ func (h *Handler) forget(w http.ResponseWriter, r *http.Request) {
 	}
 
 	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
-	attempt := ""
-	if force {
-		attempt = r.Header.Get("X-Once-Attempt-Token")
-		if attempt == "" {
-			writeError(w, http.StatusBadRequest, "force delete requires X-Once-Attempt-Token")
-			return
-		}
+	attempt := r.Header.Get("X-Once-Attempt-Token")
+	if attempt == "" {
+		writeError(w, http.StatusBadRequest, "delete requires X-Once-Attempt-Token")
+		return
 	}
 	deleted, err := h.store.Forget(key, force, attempt)
 	if errors.Is(err, once.ErrRunning) {
@@ -201,12 +197,12 @@ func readJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid json: %v", err))
+		writeError(w, http.StatusBadRequest, "invalid json")
 		return false
 	}
 	var extra any
 	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
-		writeError(w, http.StatusBadRequest, "invalid json: trailing data")
+		writeError(w, http.StatusBadRequest, "invalid json")
 		return false
 	}
 	return true

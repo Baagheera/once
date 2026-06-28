@@ -3,13 +3,17 @@
 Start the server:
 
 ```sh
-once serve --listen 127.0.0.1:7410 --token secret
+once serve --listen 127.0.0.1:7410
 ```
+
+By default, the server creates `once.db.token` and prints only the token file
+path. Read that file, pass `--token-file`, or set `ONCE_TOKEN` for scripted
+use. Explicit `--token` values must be at least 32 characters.
 
 All endpoints except `GET /healthz` require:
 
 ```http
-Authorization: Bearer secret
+Authorization: Bearer <token>
 ```
 
 ## Reserve
@@ -77,11 +81,11 @@ DELETE /v1/records/webhook:event-123
 ```
 
 Deletes the record. This is mostly useful for local testing and manual repair.
-Running records are protected. Use `?force=1` to delete a running record
-deliberately.
-
-When force deleting over HTTP, send the reservation token:
+Send the reservation token for every HTTP delete:
 
 ```http
 X-Once-Attempt-Token: opaque-token
 ```
+
+Running records are additionally protected. Use `?force=1` to delete a running
+record deliberately.

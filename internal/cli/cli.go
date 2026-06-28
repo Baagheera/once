@@ -9,7 +9,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 )
 
 const defaultStorePath = "once.db"
+const minAuthTokenLength = 32
 
 func Run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
@@ -117,7 +120,8 @@ func serveCommand(args []string, storePath string, stdout, stderr io.Writer) int
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	listen := fs.String("listen", "127.0.0.1:7410", "listen address")
-	token := fs.String("token", "", "bearer token for HTTP API; generated if empty")
+	token := fs.String("token", "", "bearer token for HTTP API; must be at least 32 characters")
+	tokenFile := fs.String("token-file", "", "file containing the HTTP bearer token; created if missing")
 	unsafeNoAuth := fs.Bool("unsafe-no-auth", false, "disable HTTP auth")
 	allowRemote := fs.Bool("allow-remote", false, "allow non-loopback listen addresses")
 	if err := fs.Parse(args); err != nil {
@@ -143,18 +147,19 @@ func serveCommand(args []string, storePath string, stdout, stderr io.Writer) int
 	}
 	defer store.Close()
 
-	authToken := strings.TrimSpace(*token)
-	if authToken == "" && !*unsafeNoAuth {
-		authToken, err = once.NewAttemptToken()
-		if err != nil {
-			fmt.Fprintf(stderr, "once: generate token: %v\n", err)
-			return 1
-		}
+	authToken, authTokenFile, err := resolveAuthToken(*token, *tokenFile, *unsafeNoAuth, storePath)
+	if err != nil {
+		fmt.Fprintf(stderr, "once: auth token: %v\n", err)
+		return 2
 	}
 
 	fmt.Fprintf(stdout, "once: listening on %s\n", *listen)
 	if authToken != "" {
-		fmt.Fprintf(stdout, "once: auth token %s\n", authToken)
+		if authTokenFile != "" {
+			fmt.Fprintf(stdout, "once: auth token file %s\n", authTokenFile)
+		} else {
+			fmt.Fprintln(stdout, "once: auth enabled")
+		}
 	} else {
 		fmt.Fprintln(stdout, "once: warning: HTTP auth disabled")
 	}
@@ -250,7 +255,7 @@ func forgetCommand(args []string, storePath string, stdout, stderr io.Writer) in
 	}
 	defer store.Close()
 
-	ok, err := store.Forget(key, *force, "")
+	ok, err := store.AdminForget(key, *force)
 	if errors.Is(err, once.ErrRunning) {
 		fmt.Fprintf(stderr, "once: key is still running: %s\n", key)
 		return 1
@@ -321,11 +326,108 @@ func replayRecord(rec once.Record, stdout, stderr io.Writer) int {
 	return rec.ExitCode
 }
 
+func resolveAuthToken(flagToken, tokenFile string, unsafeNoAuth bool, storePath string) (string, string, error) {
+	flagToken = strings.TrimSpace(flagToken)
+	tokenFile = strings.TrimSpace(tokenFile)
+	if unsafeNoAuth {
+		if flagToken != "" || tokenFile != "" {
+			return "", "", fmt.Errorf("--token and --token-file cannot be used with --unsafe-no-auth")
+		}
+		return "", "", nil
+	}
+	if flagToken != "" && tokenFile != "" {
+		return "", "", fmt.Errorf("--token and --token-file are mutually exclusive")
+	}
+	if flagToken != "" {
+		if err := validateAuthToken(flagToken); err != nil {
+			return "", "", err
+		}
+		return flagToken, "", nil
+	}
+	if tokenFile != "" {
+		token, err := loadOrCreateTokenFile(tokenFile)
+		return token, tokenFile, err
+	}
+	if envToken := strings.TrimSpace(os.Getenv("ONCE_TOKEN")); envToken != "" {
+		if err := validateAuthToken(envToken); err != nil {
+			return "", "", fmt.Errorf("ONCE_TOKEN: %w", err)
+		}
+		return envToken, "", nil
+	}
+
+	defaultFile := storePath + ".token"
+	token, err := loadOrCreateTokenFile(defaultFile)
+	return token, defaultFile, err
+}
+
+func validateAuthToken(token string) error {
+	if len(token) < minAuthTokenLength {
+		return fmt.Errorf("token must be at least %d characters", minAuthTokenLength)
+	}
+	if strings.ContainsAny(token, " \t\r\n") {
+		return fmt.Errorf("token must not contain whitespace")
+	}
+	return nil
+}
+
+func loadOrCreateTokenFile(path string) (string, error) {
+	if path == "" {
+		return "", fmt.Errorf("empty token file path")
+	}
+	path = filepath.Clean(path)
+	if err := once.RejectSymlinkPath(path); err != nil {
+		return "", err
+	}
+
+	data, err := os.ReadFile(path)
+	if err == nil {
+		token := strings.TrimSpace(string(data))
+		if err := validateAuthToken(token); err != nil {
+			return "", err
+		}
+		if err := once.RestrictLocalFile(path); err != nil {
+			return "", err
+		}
+		return token, nil
+	}
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return "", err
+		}
+	}
+	if err := once.RejectSymlinkPath(path); err != nil {
+		return "", err
+	}
+	token, err := once.NewAttemptToken()
+	if err != nil {
+		return "", err
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", err
+	}
+	if _, err := file.WriteString(token + "\n"); err != nil {
+		_ = file.Close()
+		return "", err
+	}
+	if err := file.Close(); err != nil {
+		return "", err
+	}
+	if err := once.RestrictLocalFile(path); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
 func usage(w io.Writer) {
 	lines := []string{
 		"usage:",
 		"  once [--store PATH] run --key KEY -- COMMAND [ARG...]",
-		"  once [--store PATH] serve [--listen ADDR] [--token TOKEN]",
+		"  once [--store PATH] serve [--listen ADDR] [--token TOKEN | --token-file PATH]",
 		"  once [--store PATH] status KEY",
 		"  once [--store PATH] get KEY",
 		"  once [--store PATH] forget [--force] KEY",

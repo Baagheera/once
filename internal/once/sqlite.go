@@ -21,10 +21,17 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 	if path == "" {
 		return nil, fmt.Errorf("empty sqlite path")
 	}
+	path = filepath.Clean(path)
+	if err := RejectSymlinkPath(path); err != nil {
+		return nil, err
+	}
 	if dir := filepath.Dir(path); dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, err
 		}
+	}
+	if err := RejectSymlinkPath(path); err != nil {
+		return nil, err
 	}
 	if file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600); err != nil {
 		return nil, err
@@ -43,7 +50,10 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	restrictSQLiteFiles(path)
+	if err := restrictSQLiteFiles(path); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -250,12 +260,50 @@ func (s *SQLiteStore) Forget(key string, force bool, attempt string) (bool, erro
 	if err := ValidateKey(key); err != nil {
 		return false, err
 	}
-	var attemptHash string
-	if attempt != "" {
-		if err := ValidateAttemptToken(attempt); err != nil {
+	if err := ValidateAttemptToken(attempt); err != nil {
+		return false, err
+	}
+	attemptHash := HashAttemptToken(attempt)
+
+	if !force {
+		res, err := s.db.Exec(`DELETE FROM once_records WHERE key = ? AND state <> 'running' AND attempt_hash = ?`, key, attemptHash)
+		if err != nil {
 			return false, err
 		}
-		attemptHash = HashAttemptToken(attempt)
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return false, err
+		}
+		if affected != 0 {
+			return true, nil
+		}
+		rec, err := s.Get(key)
+		if errors.Is(err, ErrNotFound) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if rec.State == Running && rec.Attempt == attemptHash {
+			return false, ErrRunning
+		}
+		return false, nil
+	}
+
+	res, err := s.db.Exec(`DELETE FROM once_records WHERE key = ? AND attempt_hash = ?`, key, attemptHash)
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected != 0, nil
+}
+
+func (s *SQLiteStore) AdminForget(key string, force bool) (bool, error) {
+	if err := ValidateKey(key); err != nil {
+		return false, err
 	}
 
 	if !force {
@@ -283,13 +331,7 @@ func (s *SQLiteStore) Forget(key string, force bool, attempt string) (bool, erro
 		return false, nil
 	}
 
-	var res sql.Result
-	var err error
-	if attemptHash == "" {
-		res, err = s.db.Exec(`DELETE FROM once_records WHERE key = ?`, key)
-	} else {
-		res, err = s.db.Exec(`DELETE FROM once_records WHERE key = ? AND attempt_hash = ?`, key, attemptHash)
-	}
+	res, err := s.db.Exec(`DELETE FROM once_records WHERE key = ?`, key)
 	if err != nil {
 		return false, err
 	}
@@ -308,12 +350,20 @@ func parseTime(s string) (time.Time, error) {
 	return time.Parse(time.RFC3339Nano, s)
 }
 
-func restrictSQLiteFiles(path string) {
+func restrictSQLiteFiles(path string) error {
 	for _, name := range []string{path, path + "-wal", path + "-shm"} {
+		if err := RejectSymlinkPath(name); err != nil {
+			return err
+		}
 		if _, err := os.Stat(name); err == nil {
-			_ = os.Chmod(name, 0o600)
+			if err := RestrictLocalFile(name); err != nil {
+				return err
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
 		}
 	}
+	return nil
 }
 
 func (s *SQLiteStore) ensureColumn(table, column, ddl string) error {
