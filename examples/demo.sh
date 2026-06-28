@@ -59,7 +59,6 @@ http_db="$tmp/once-http.db"
 token_file="$tmp/once-http.token"
 server_log="$tmp/once-http.log"
 addr="${ONCE_ADDR:-127.0.0.1:17410}"
-token="once-demo-token-123456789012345678901234"
 
 printf 'once: a small idempotency log for side effects\n'
 
@@ -104,8 +103,6 @@ prompt "once status charge:order-42"
 "$once_bin" --store "$fail_db" status charge:order-42
 
 printf '\n# HTTP reserve / commit / replay\n'
-printf '%s\n' "$token" > "$token_file"
-chmod 600 "$token_file" 2>/dev/null || true
 prompt "once serve --listen $addr --token-file demo.token"
 "$once_bin" --store "$http_db" serve --listen "$addr" --token-file "$token_file" > "$server_log" 2>&1 &
 server_pid=$!
@@ -119,6 +116,11 @@ until curl -fs "http://$addr/healthz" >/dev/null 2>&1; do
 	fi
 	sleep 0.2
 done
+token="$(cat "$token_file")"
+if [ -z "$token" ]; then
+	echo "server did not create a token file" >&2
+	exit 1
+fi
 printf 'once: listening on %s\n' "$addr"
 printf 'once: auth token file demo.token\n'
 

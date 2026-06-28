@@ -117,8 +117,10 @@ once serve --listen 127.0.0.1:7410
 ```
 
 If no token is provided, once creates `once.db.token` next to the default
-database and prints only the token file path. You can also use `--token-file`
-or set `ONCE_TOKEN`. Explicit `--token` values must be at least 32 characters.
+database and prints only the token file path. Prefer token files for normal
+use. Tokens passed through flags or environment variables can be visible to
+other local processes on shared machines. Explicit `--token` values must be at
+least 32 characters.
 
 Every endpoint except `/healthz` requires:
 
