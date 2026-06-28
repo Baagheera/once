@@ -1,9 +1,9 @@
 module github.com/Baagheera/once
 
-go 1.23.0
+go 1.25.0
 
 require (
-	golang.org/x/sys v0.35.0
+	golang.org/x/sys v0.46.0
 	modernc.org/sqlite v1.37.1
 )
 
