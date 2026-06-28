@@ -278,7 +278,9 @@ func TestConcurrentReserveOnlyOneFresh(t *testing.T) {
 func TestOpenSQLiteRejectsURIStylePaths(t *testing.T) {
 	tests := []string{
 		":memory:",
+		filepath.Join("x", "..", ":memory:"),
 		"file:" + filepath.Join(t.TempDir(), "once.db") + "?mode=rwc",
+		filepath.Join("x", "..", "file:"+filepath.Join(t.TempDir(), "once.db")),
 		filepath.Join(t.TempDir(), "once.db?mode=memory"),
 	}
 	for _, path := range tests {

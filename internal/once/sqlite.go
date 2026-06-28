@@ -26,6 +26,9 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 		return nil, err
 	}
 	path = filepath.Clean(path)
+	if err := rejectSQLiteDSNPath(path); err != nil {
+		return nil, err
+	}
 	if err := RejectSymlinkPath(path); err != nil {
 		return nil, err
 	}
