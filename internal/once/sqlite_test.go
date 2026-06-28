@@ -1,7 +1,9 @@
 package once
 
 import (
+	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -289,6 +291,57 @@ func TestOpenSQLiteRejectsURIStylePaths(t *testing.T) {
 			if err == nil {
 				_ = store.Close()
 				t.Fatalf("OpenSQLite(%q) succeeded, want error", path)
+			}
+		})
+	}
+}
+
+func TestOpenSQLiteRejectsSymlinkAncestor(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires privileges on some Windows installs")
+	}
+
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real")
+	if err := os.MkdirAll(filepath.Join(real, "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := OpenSQLite(filepath.Join(link, "sub", "once.db"))
+	if err == nil {
+		_ = store.Close()
+		t.Fatal("expected symlink ancestor to be rejected")
+	}
+}
+
+func TestOpenSQLiteRejectsSymlinkSidecarsBeforeOpen(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires privileges on some Windows installs")
+	}
+
+	for _, suffix := range []string{"-wal", "-shm"} {
+		t.Run(suffix, func(t *testing.T) {
+			dir := t.TempDir()
+			db := filepath.Join(dir, "once.db")
+			target := filepath.Join(dir, "target")
+			if err := os.WriteFile(target, []byte("target"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, db+suffix); err != nil {
+				t.Fatal(err)
+			}
+
+			store, err := OpenSQLite(db)
+			if err == nil {
+				_ = store.Close()
+				t.Fatalf("expected symlink %s sidecar to be rejected", suffix)
+			}
+			if _, err := os.Stat(db); !os.IsNotExist(err) {
+				t.Fatalf("db exists after rejected sidecar: %v", err)
 			}
 		})
 	}

@@ -40,9 +40,15 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 	if err := RejectSymlinkPath(path); err != nil {
 		return nil, err
 	}
+	if err := rejectSQLiteFileSymlinks(path); err != nil {
+		return nil, err
+	}
 	if file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600); err != nil {
 		return nil, err
 	} else if err := file.Close(); err != nil {
+		return nil, err
+	}
+	if err := restrictSQLiteFiles(path); err != nil {
 		return nil, err
 	}
 
@@ -366,11 +372,14 @@ func parseTime(s string) (time.Time, error) {
 }
 
 func restrictSQLiteFiles(path string) error {
-	for _, name := range []string{path, path + "-wal", path + "-shm"} {
+	for _, name := range sqliteFilePaths(path) {
 		if err := RejectSymlinkPath(name); err != nil {
 			return err
 		}
-		if _, err := os.Stat(name); err == nil {
+		if info, err := os.Stat(name); err == nil {
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("sqlite path must be a regular file: %s", name)
+			}
 			if err := RestrictLocalFile(name); err != nil {
 				return err
 			}
@@ -379,6 +388,19 @@ func restrictSQLiteFiles(path string) error {
 		}
 	}
 	return nil
+}
+
+func rejectSQLiteFileSymlinks(path string) error {
+	for _, name := range sqliteFilePaths(path) {
+		if err := RejectSymlinkPath(name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sqliteFilePaths(path string) []string {
+	return []string{path, path + "-wal", path + "-shm"}
 }
 
 func (s *SQLiteStore) ensureColumn(table, column, ddl string) error {
