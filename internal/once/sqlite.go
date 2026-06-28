@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -20,6 +21,9 @@ type SQLiteStore struct {
 func OpenSQLite(path string) (*SQLiteStore, error) {
 	if path == "" {
 		return nil, fmt.Errorf("empty sqlite path")
+	}
+	if err := rejectSQLiteDSNPath(path); err != nil {
+		return nil, err
 	}
 	path = filepath.Clean(path)
 	if err := RejectSymlinkPath(path); err != nil {
@@ -55,6 +59,14 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+func rejectSQLiteDSNPath(path string) error {
+	lower := strings.ToLower(path)
+	if lower == ":memory:" || strings.HasPrefix(lower, "file:") || strings.Contains(path, "?") {
+		return fmt.Errorf("sqlite path must be a local filesystem path")
+	}
+	return nil
 }
 
 func (s *SQLiteStore) Close() error {

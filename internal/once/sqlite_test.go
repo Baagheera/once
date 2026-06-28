@@ -1,6 +1,7 @@
 package once
 
 import (
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -271,5 +272,22 @@ func TestConcurrentReserveOnlyOneFresh(t *testing.T) {
 
 	if freshCount != 1 {
 		t.Fatalf("freshCount = %d, want 1", freshCount)
+	}
+}
+
+func TestOpenSQLiteRejectsURIStylePaths(t *testing.T) {
+	tests := []string{
+		":memory:",
+		"file:" + filepath.Join(t.TempDir(), "once.db") + "?mode=rwc",
+		filepath.Join(t.TempDir(), "once.db?mode=memory"),
+	}
+	for _, path := range tests {
+		t.Run(path, func(t *testing.T) {
+			store, err := OpenSQLite(path)
+			if err == nil {
+				_ = store.Close()
+				t.Fatalf("OpenSQLite(%q) succeeded, want error", path)
+			}
+		})
 	}
 }
