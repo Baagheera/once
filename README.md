@@ -48,6 +48,15 @@ go run ./cmd/once status demo
 go run ./cmd/once get demo
 ```
 
+Run the local demo:
+
+```sh
+sh examples/demo.sh
+```
+
+It shows duplicate side effects, replayed command output, replayed failure
+results, and the HTTP reserve/commit/replay flow.
+
 Use a different database:
 
 ```sh
