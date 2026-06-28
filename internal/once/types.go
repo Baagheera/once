@@ -12,6 +12,7 @@ const (
 
 type Record struct {
 	Key        string
+	Attempt    string
 	State      State
 	ExitCode   int
 	Stdout     []byte

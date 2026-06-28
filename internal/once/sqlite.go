@@ -22,9 +22,14 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("empty sqlite path")
 	}
 	if dir := filepath.Dir(path); dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, err
 		}
+	}
+	if file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600); err != nil {
+		return nil, err
+	} else if err := file.Close(); err != nil {
+		return nil, err
 	}
 
 	db, err := sql.Open("sqlite", path)
@@ -38,6 +43,7 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	restrictSQLiteFiles(path)
 	return s, nil
 }
 
@@ -60,6 +66,7 @@ func (s *SQLiteStore) init() error {
 	_, err := s.db.Exec(`
 CREATE TABLE IF NOT EXISTS once_records (
 	key TEXT PRIMARY KEY,
+	attempt_hash TEXT NOT NULL DEFAULT '',
 	state TEXT NOT NULL CHECK (state IN ('running', 'succeeded', 'failed')),
 	exit_code INTEGER NOT NULL DEFAULT 0,
 	stdout BLOB NOT NULL DEFAULT X'',
@@ -73,12 +80,15 @@ CREATE TABLE IF NOT EXISTS once_records (
 
 CREATE INDEX IF NOT EXISTS once_records_state_idx ON once_records(state);
 `)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.ensureColumn("once_records", "attempt_hash", "ALTER TABLE once_records ADD COLUMN attempt_hash TEXT NOT NULL DEFAULT ''")
 }
 
 func (s *SQLiteStore) Reserve(key string, command []string) (Record, bool, error) {
-	if key == "" {
-		return Record{}, false, fmt.Errorf("empty key")
+	if err := ValidateKey(key); err != nil {
+		return Record{}, false, err
 	}
 
 	now := time.Now().UTC()
@@ -86,13 +96,18 @@ func (s *SQLiteStore) Reserve(key string, command []string) (Record, bool, error
 	if err != nil {
 		return Record{}, false, err
 	}
+	attempt, err := NewAttemptToken()
+	if err != nil {
+		return Record{}, false, err
+	}
+	attemptHash := HashAttemptToken(attempt)
 
 	res, err := s.db.Exec(`
 INSERT OR IGNORE INTO once_records
-	(key, state, command, started_at, updated_at)
+	(key, attempt_hash, state, command, started_at, updated_at)
 VALUES
-	(?, 'running', ?, ?, ?)
-`, key, string(commandJSON), formatTime(now), formatTime(now))
+	(?, ?, 'running', ?, ?, ?)
+`, key, attemptHash, string(commandJSON), formatTime(now), formatTime(now))
 	if err != nil {
 		return Record{}, false, err
 	}
@@ -106,13 +121,22 @@ VALUES
 	if err != nil {
 		return Record{}, false, err
 	}
-	if affected == 0 && len(command) != 0 && len(rec.Command) != 0 && !sameCommand(rec.Command, command) {
+	if affected == 0 && !sameCommand(rec.Command, command) {
 		return rec, false, ErrConflict
+	}
+	if affected == 1 {
+		rec.Attempt = attempt
 	}
 	return rec, affected == 1, nil
 }
 
-func (s *SQLiteStore) Commit(key string, state State, exitCode int, stdout, stderr []byte, runErr string) (Record, error) {
+func (s *SQLiteStore) Commit(key, attempt string, state State, exitCode int, stdout, stderr []byte, runErr string) (Record, error) {
+	if err := ValidateKey(key); err != nil {
+		return Record{}, err
+	}
+	if err := ValidateAttemptToken(attempt); err != nil {
+		return Record{}, err
+	}
 	if state != Succeeded && state != Failed {
 		return Record{}, fmt.Errorf("invalid terminal state: %s", state)
 	}
@@ -124,6 +148,7 @@ func (s *SQLiteStore) Commit(key string, state State, exitCode int, stdout, stde
 	}
 
 	now := time.Now().UTC()
+	attemptHash := HashAttemptToken(attempt)
 	res, err := s.db.Exec(`
 UPDATE once_records
 SET state = ?,
@@ -133,8 +158,8 @@ SET state = ?,
 	error = ?,
 	finished_at = ?,
 	updated_at = ?
-WHERE key = ? AND state = 'running'
-`, string(state), exitCode, stdout, stderr, runErr, formatTime(now), formatTime(now), key)
+WHERE key = ? AND state = 'running' AND attempt_hash = ?
+`, string(state), exitCode, stdout, stderr, runErr, formatTime(now), formatTime(now), key, attemptHash)
 	if err != nil {
 		return Record{}, err
 	}
@@ -154,7 +179,8 @@ WHERE key = ? AND state = 'running'
 		if rec.State == Running {
 			return Record{}, ErrConflict
 		}
-		if sameResult(rec, state, exitCode, stdout, stderr, runErr) {
+		if rec.Attempt == attemptHash && sameResult(rec, state, exitCode, stdout, stderr, runErr) {
+			rec.Attempt = attempt
 			return rec, nil
 		}
 		return Record{}, ErrConflict
@@ -165,13 +191,14 @@ WHERE key = ? AND state = 'running'
 
 func (s *SQLiteStore) Get(key string) (Record, error) {
 	row := s.db.QueryRow(`
-SELECT key, state, exit_code, stdout, stderr, error, command, started_at, finished_at, updated_at
+SELECT key, attempt_hash, state, exit_code, stdout, stderr, error, command, started_at, finished_at, updated_at
 FROM once_records
 WHERE key = ?
 `, key)
 
 	var rec Record
 	var state string
+	var attemptHash string
 	var commandJSON string
 	var startedAt string
 	var finishedAt sql.NullString
@@ -179,6 +206,7 @@ WHERE key = ?
 
 	err := row.Scan(
 		&rec.Key,
+		&attemptHash,
 		&state,
 		&rec.ExitCode,
 		&rec.Stdout,
@@ -197,6 +225,7 @@ WHERE key = ?
 	}
 
 	rec.State = State(state)
+	rec.Attempt = attemptHash
 	if err := json.Unmarshal([]byte(commandJSON), &rec.Command); err != nil {
 		return Record{}, err
 	}
@@ -217,8 +246,30 @@ WHERE key = ?
 	return rec, nil
 }
 
-func (s *SQLiteStore) Forget(key string, force bool) (bool, error) {
+func (s *SQLiteStore) Forget(key string, force bool, attempt string) (bool, error) {
+	if err := ValidateKey(key); err != nil {
+		return false, err
+	}
+	var attemptHash string
+	if attempt != "" {
+		if err := ValidateAttemptToken(attempt); err != nil {
+			return false, err
+		}
+		attemptHash = HashAttemptToken(attempt)
+	}
+
 	if !force {
+		res, err := s.db.Exec(`DELETE FROM once_records WHERE key = ? AND state <> 'running'`, key)
+		if err != nil {
+			return false, err
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return false, err
+		}
+		if affected != 0 {
+			return true, nil
+		}
 		rec, err := s.Get(key)
 		if errors.Is(err, ErrNotFound) {
 			return false, nil
@@ -229,9 +280,16 @@ func (s *SQLiteStore) Forget(key string, force bool) (bool, error) {
 		if rec.State == Running {
 			return false, ErrRunning
 		}
+		return false, nil
 	}
 
-	res, err := s.db.Exec(`DELETE FROM once_records WHERE key = ?`, key)
+	var res sql.Result
+	var err error
+	if attemptHash == "" {
+		res, err = s.db.Exec(`DELETE FROM once_records WHERE key = ?`, key)
+	} else {
+		res, err = s.db.Exec(`DELETE FROM once_records WHERE key = ? AND attempt_hash = ?`, key, attemptHash)
+	}
 	if err != nil {
 		return false, err
 	}
@@ -248,6 +306,42 @@ func formatTime(t time.Time) string {
 
 func parseTime(s string) (time.Time, error) {
 	return time.Parse(time.RFC3339Nano, s)
+}
+
+func restrictSQLiteFiles(path string) {
+	for _, name := range []string{path, path + "-wal", path + "-shm"} {
+		if _, err := os.Stat(name); err == nil {
+			_ = os.Chmod(name, 0o600)
+		}
+	}
+}
+
+func (s *SQLiteStore) ensureColumn(table, column, ddl string) error {
+	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name string
+		var typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return rows.Err()
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(ddl)
+	return err
 }
 
 func sameCommand(a, b []string) bool {

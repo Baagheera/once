@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os/exec"
 	"strings"
@@ -103,7 +104,7 @@ func runCommand(args []string, storePath string, stdout, stderr io.Writer) int {
 		state = once.Failed
 	}
 
-	rec, err = store.Commit(*key, state, exitCode, out, errOut, runErr)
+	rec, err = store.Commit(*key, rec.Attempt, state, exitCode, out, errOut, runErr)
 	if err != nil {
 		fmt.Fprintf(stderr, "once: commit: %v\n", err)
 		return 1
@@ -116,11 +117,22 @@ func serveCommand(args []string, storePath string, stdout, stderr io.Writer) int
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	listen := fs.String("listen", "127.0.0.1:7410", "listen address")
+	token := fs.String("token", "", "bearer token for HTTP API; generated if empty")
+	unsafeNoAuth := fs.Bool("unsafe-no-auth", false, "disable HTTP auth")
+	allowRemote := fs.Bool("allow-remote", false, "allow non-loopback listen addresses")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if fs.NArg() != 0 {
 		fmt.Fprintln(stderr, "once: serve does not take positional arguments")
+		return 2
+	}
+	if !*allowRemote && !isLoopbackListen(*listen) {
+		fmt.Fprintln(stderr, "once: non-loopback listen address requires --allow-remote")
+		return 2
+	}
+	if *unsafeNoAuth && !isLoopbackListen(*listen) {
+		fmt.Fprintln(stderr, "once: --unsafe-no-auth is only allowed on loopback addresses")
 		return 2
 	}
 
@@ -131,8 +143,31 @@ func serveCommand(args []string, storePath string, stdout, stderr io.Writer) int
 	}
 	defer store.Close()
 
+	authToken := strings.TrimSpace(*token)
+	if authToken == "" && !*unsafeNoAuth {
+		authToken, err = once.NewAttemptToken()
+		if err != nil {
+			fmt.Fprintf(stderr, "once: generate token: %v\n", err)
+			return 1
+		}
+	}
+
 	fmt.Fprintf(stdout, "once: listening on %s\n", *listen)
-	if err := http.ListenAndServe(*listen, server.NewHandler(store)); err != nil {
+	if authToken != "" {
+		fmt.Fprintf(stdout, "once: auth token %s\n", authToken)
+	} else {
+		fmt.Fprintln(stdout, "once: warning: HTTP auth disabled")
+	}
+
+	srv := &http.Server{
+		Addr:              *listen,
+		Handler:           server.NewHandler(store, server.Options{AuthToken: authToken}),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	if err := srv.ListenAndServe(); err != nil {
 		fmt.Fprintf(stderr, "once: serve: %v\n", err)
 		return 1
 	}
@@ -215,7 +250,7 @@ func forgetCommand(args []string, storePath string, stdout, stderr io.Writer) in
 	}
 	defer store.Close()
 
-	ok, err := store.Forget(key, *force)
+	ok, err := store.Forget(key, *force, "")
 	if errors.Is(err, once.ErrRunning) {
 		fmt.Fprintf(stderr, "once: key is still running: %s\n", key)
 		return 1
@@ -290,10 +325,22 @@ func usage(w io.Writer) {
 	lines := []string{
 		"usage:",
 		"  once [--store PATH] run --key KEY -- COMMAND [ARG...]",
-		"  once [--store PATH] serve [--listen ADDR]",
+		"  once [--store PATH] serve [--listen ADDR] [--token TOKEN]",
 		"  once [--store PATH] status KEY",
 		"  once [--store PATH] get KEY",
 		"  once [--store PATH] forget [--force] KEY",
 	}
 	fmt.Fprintln(w, strings.Join(lines, "\n"))
+}
+
+func isLoopbackListen(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

@@ -104,36 +104,51 @@ Global flags:
 `once serve` exposes the same ledger over HTTP:
 
 ```sh
-once serve --listen 127.0.0.1:7410
+once serve --listen 127.0.0.1:7410 --token secret
+```
+
+If `--token` is omitted, once generates an ephemeral token and prints it at
+startup. Every endpoint except `/healthz` requires:
+
+```http
+Authorization: Bearer <token>
 ```
 
 Reserve a key:
 
 ```sh
 curl -s http://127.0.0.1:7410/v1/reserve \
+  -H 'authorization: Bearer secret' \
   -H 'content-type: application/json' \
   -d '{"key":"webhook:event-123","command":["send-webhook"]}'
 ```
 
-Commit the result:
+The response includes an `attempt_token` for the fresh reservation. Commit the
+result with that token:
 
 ```sh
 curl -s http://127.0.0.1:7410/v1/commit \
+  -H 'authorization: Bearer secret' \
   -H 'content-type: application/json' \
-  -d '{"key":"webhook:event-123","state":"succeeded","exit_code":0,"stdout_b64":"b2sK"}'
+  -d '{"key":"webhook:event-123","attempt_token":"...","state":"succeeded","exit_code":0,"stdout_b64":"b2sK"}'
 ```
 
 Fetch the record:
 
 ```sh
-curl -s http://127.0.0.1:7410/v1/records/webhook:event-123
+curl -s http://127.0.0.1:7410/v1/records/webhook:event-123 \
+  -H 'authorization: Bearer secret'
 ```
 
 Byte fields such as `stdout_b64` and `stderr_b64` are JSON base64 strings. The HTTP
 server does not run commands; it only stores and returns idempotency records.
 
 Deleting a `running` record requires `--force` in the CLI or `?force=1` in the
-HTTP API.
+HTTP API. In HTTP mode, force delete also requires `X-Once-Attempt-Token`.
+
+Do not expose `once serve` to untrusted networks. Non-loopback listeners require
+`--allow-remote`, and bearer authentication is still required unless auth is
+explicitly disabled on a loopback address with `--unsafe-no-auth`.
 
 ## Non-goals
 

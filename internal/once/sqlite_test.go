@@ -24,7 +24,7 @@ func TestReserveCommitAndReplay(t *testing.T) {
 		t.Fatalf("state = %s, want %s", rec.State, Running)
 	}
 
-	rec, err = store.Commit("k1", Succeeded, 0, []byte("hello\n"), nil, "")
+	rec, err = store.Commit("k1", rec.Attempt, Succeeded, 0, []byte("hello\n"), nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,15 +51,16 @@ func TestForget(t *testing.T) {
 	}
 	defer store.Close()
 
-	if _, _, err := store.Reserve("k1", []string{"true"}); err != nil {
+	rec, _, err := store.Reserve("k1", []string{"true"})
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := store.Commit("k1", Succeeded, 0, nil, nil, ""); err != nil {
+	if _, err := store.Commit("k1", rec.Attempt, Succeeded, 0, nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 
-	ok, err := store.Forget("k1", false)
+	ok, err := store.Forget("k1", false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,10 +80,11 @@ func TestReserveRejectsDifferentCommand(t *testing.T) {
 	}
 	defer store.Close()
 
-	if _, _, err := store.Reserve("k1", []string{"echo", "one"}); err != nil {
+	rec, _, err := store.Reserve("k1", []string{"echo", "one"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Commit("k1", Succeeded, 0, []byte("one\n"), nil, ""); err != nil {
+	if _, err := store.Commit("k1", rec.Attempt, Succeeded, 0, []byte("one\n"), nil, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -98,13 +100,14 @@ func TestCommitIsIdempotentForSameResult(t *testing.T) {
 	}
 	defer store.Close()
 
-	if _, _, err := store.Reserve("k1", []string{"echo", "one"}); err != nil {
+	rec, _, err := store.Reserve("k1", []string{"echo", "one"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Commit("k1", Succeeded, 0, []byte("one\n"), nil, ""); err != nil {
+	if _, err := store.Commit("k1", rec.Attempt, Succeeded, 0, []byte("one\n"), nil, ""); err != nil {
 		t.Fatal(err)
 	}
-	rec, err := store.Commit("k1", Succeeded, 0, []byte("one\n"), nil, "")
+	rec, err = store.Commit("k1", rec.Attempt, Succeeded, 0, []byte("one\n"), nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,14 +123,53 @@ func TestCommitConflictsForDifferentResult(t *testing.T) {
 	}
 	defer store.Close()
 
-	if _, _, err := store.Reserve("k1", []string{"echo", "one"}); err != nil {
+	rec, _, err := store.Reserve("k1", []string{"echo", "one"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Commit("k1", Succeeded, 0, []byte("one\n"), nil, ""); err != nil {
+	if _, err := store.Commit("k1", rec.Attempt, Succeeded, 0, []byte("one\n"), nil, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Commit("k1", Succeeded, 0, []byte("two\n"), nil, ""); err != ErrConflict {
+	if _, err := store.Commit("k1", rec.Attempt, Succeeded, 0, []byte("two\n"), nil, ""); err != ErrConflict {
 		t.Fatalf("Commit err = %v, want ErrConflict", err)
+	}
+}
+
+func TestCommitRejectsWrongAttempt(t *testing.T) {
+	store, err := OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	rec, _, err := store.Reserve("k1", []string{"echo", "one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongAttempt, err := NewAttemptToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wrongAttempt == rec.Attempt {
+		t.Fatal("unexpected token collision")
+	}
+	if _, err := store.Commit("k1", wrongAttempt, Succeeded, 0, []byte("one\n"), nil, ""); err != ErrConflict {
+		t.Fatalf("Commit err = %v, want ErrConflict", err)
+	}
+}
+
+func TestReserveRejectsEmptyVsNonEmptyCommand(t *testing.T) {
+	store, err := OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if _, _, err := store.Reserve("k1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Reserve("k1", []string{"echo", "one"}); err != ErrConflict {
+		t.Fatalf("Reserve err = %v, want ErrConflict", err)
 	}
 }
 
@@ -138,14 +180,34 @@ func TestForgetRunningNeedsForce(t *testing.T) {
 	}
 	defer store.Close()
 
+	rec, _, err := store.Reserve("k1", []string{"true"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := store.Forget("k1", false, ""); err != ErrRunning || ok {
+		t.Fatalf("Forget ok=%v err=%v, want ErrRunning", ok, err)
+	}
+	if ok, err := store.Forget("k1", true, rec.Attempt); err != nil || !ok {
+		t.Fatalf("Forget force ok=%v err=%v", ok, err)
+	}
+}
+
+func TestForceForgetRejectsWrongAttempt(t *testing.T) {
+	store, err := OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
 	if _, _, err := store.Reserve("k1", []string{"true"}); err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := store.Forget("k1", false); err != ErrRunning || ok {
-		t.Fatalf("Forget ok=%v err=%v, want ErrRunning", ok, err)
+	wrongAttempt, err := NewAttemptToken()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if ok, err := store.Forget("k1", true); err != nil || !ok {
-		t.Fatalf("Forget force ok=%v err=%v", ok, err)
+	if ok, err := store.Forget("k1", true, wrongAttempt); err != nil || ok {
+		t.Fatalf("Forget ok=%v err=%v, want no delete", ok, err)
 	}
 }
 

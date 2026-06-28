@@ -1,9 +1,12 @@
 package server
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"mime"
 	"net/http"
 	"strings"
 	"time"
@@ -12,19 +15,27 @@ import (
 )
 
 type Handler struct {
-	store once.Store
+	store     once.Store
+	authToken string
 }
 
-func NewHandler(store once.Store) http.Handler {
-	h := &Handler{store: store}
+type Options struct {
+	AuthToken string
+}
+
+func NewHandler(store once.Store, options Options) http.Handler {
+	h := &Handler{
+		store:     store,
+		authToken: options.AuthToken,
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", h.health)
 	mux.HandleFunc("POST /v1/reserve", h.reserve)
 	mux.HandleFunc("POST /v1/commit", h.commit)
-	mux.HandleFunc("GET /v1/records/", h.get)
-	mux.HandleFunc("DELETE /v1/records/", h.forget)
-	return mux
+	mux.HandleFunc("GET /v1/records/{key}", h.get)
+	mux.HandleFunc("DELETE /v1/records/{key}", h.forget)
+	return h.auth(mux)
 }
 
 type reserveRequest struct {
@@ -33,17 +44,19 @@ type reserveRequest struct {
 }
 
 type reserveResponse struct {
-	Fresh  bool        `json:"fresh"`
-	Record recordModel `json:"record"`
+	Fresh        bool        `json:"fresh"`
+	AttemptToken string      `json:"attempt_token,omitempty"`
+	Record       recordModel `json:"record"`
 }
 
 type commitRequest struct {
-	Key       string     `json:"key"`
-	State     once.State `json:"state"`
-	ExitCode  int        `json:"exit_code"`
-	StdoutB64 []byte     `json:"stdout_b64,omitempty"`
-	StderrB64 []byte     `json:"stderr_b64,omitempty"`
-	Error     string     `json:"error,omitempty"`
+	Key          string     `json:"key"`
+	AttemptToken string     `json:"attempt_token"`
+	State        once.State `json:"state"`
+	ExitCode     int        `json:"exit_code"`
+	StdoutB64    []byte     `json:"stdout_b64,omitempty"`
+	StderrB64    []byte     `json:"stderr_b64,omitempty"`
+	Error        string     `json:"error,omitempty"`
 }
 
 type recordModel struct {
@@ -69,44 +82,52 @@ func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) reserve(w http.ResponseWriter, r *http.Request) {
+	if !requireJSON(w, r) {
+		return
+	}
 	var req reserveRequest
 	if !readJSON(w, r, &req) {
 		return
 	}
-	req.Key = strings.TrimSpace(req.Key)
-	if req.Key == "" {
-		writeError(w, http.StatusBadRequest, "missing key")
+	key, ok := validKey(w, req.Key)
+	if !ok {
 		return
 	}
 
-	rec, fresh, err := h.store.Reserve(req.Key, req.Command)
+	rec, fresh, err := h.store.Reserve(key, req.Command)
 	if errors.Is(err, once.ErrConflict) {
 		writeError(w, http.StatusConflict, "key already exists with a different command")
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeInternal(w)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, reserveResponse{
+	resp := reserveResponse{
 		Fresh:  fresh,
 		Record: modelRecord(rec),
-	})
+	}
+	if fresh {
+		resp.AttemptToken = rec.Attempt
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (h *Handler) commit(w http.ResponseWriter, r *http.Request) {
+	if !requireJSON(w, r) {
+		return
+	}
 	var req commitRequest
 	if !readJSON(w, r, &req) {
 		return
 	}
-	req.Key = strings.TrimSpace(req.Key)
-	if req.Key == "" {
-		writeError(w, http.StatusBadRequest, "missing key")
+	key, ok := validKey(w, req.Key)
+	if !ok {
 		return
 	}
 
-	rec, err := h.store.Commit(req.Key, req.State, req.ExitCode, req.StdoutB64, req.StderrB64, req.Error)
+	rec, err := h.store.Commit(key, req.AttemptToken, req.State, req.ExitCode, req.StdoutB64, req.StderrB64, req.Error)
 	if errors.Is(err, once.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "key not found")
 		return
@@ -116,7 +137,7 @@ func (h *Handler) commit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(w, http.StatusBadRequest, "invalid commit")
 		return
 	}
 
@@ -124,9 +145,8 @@ func (h *Handler) commit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
-	key := recordKey(r)
-	if key == "" {
-		writeError(w, http.StatusBadRequest, "missing key")
+	key, ok := validKey(w, r.PathValue("key"))
+	if !ok {
 		return
 	}
 
@@ -136,7 +156,7 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeInternal(w)
 		return
 	}
 
@@ -144,32 +164,35 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) forget(w http.ResponseWriter, r *http.Request) {
-	key := recordKey(r)
-	if key == "" {
-		writeError(w, http.StatusBadRequest, "missing key")
+	key, ok := validKey(w, r.PathValue("key"))
+	if !ok {
 		return
 	}
 
 	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
-	ok, err := h.store.Forget(key, force)
+	attempt := ""
+	if force {
+		attempt = r.Header.Get("X-Once-Attempt-Token")
+		if attempt == "" {
+			writeError(w, http.StatusBadRequest, "force delete requires X-Once-Attempt-Token")
+			return
+		}
+	}
+	deleted, err := h.store.Forget(key, force, attempt)
 	if errors.Is(err, once.ErrRunning) {
 		writeError(w, http.StatusConflict, "key is still running")
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, http.StatusBadRequest, "invalid delete")
 		return
 	}
-	if !ok {
+	if !deleted {
 		writeError(w, http.StatusNotFound, "key not found")
 		return
 	}
 
 	w.WriteHeader(http.StatusNoContent)
-}
-
-func recordKey(r *http.Request) string {
-	return strings.TrimPrefix(r.URL.Path, "/v1/records/")
 }
 
 func readJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
@@ -179,6 +202,11 @@ func readJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid json: %v", err))
+		return false
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid json: trailing data")
 		return false
 	}
 	return true
@@ -192,6 +220,54 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, errorModel{Error: msg})
+}
+
+func writeInternal(w http.ResponseWriter) {
+	writeError(w, http.StatusInternalServerError, "internal error")
+}
+
+func requireJSON(w http.ResponseWriter, r *http.Request) bool {
+	contentType := r.Header.Get("Content-Type")
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil || mediaType != "application/json" {
+		writeError(w, http.StatusUnsupportedMediaType, "content-type must be application/json")
+		return false
+	}
+	return true
+}
+
+func validKey(w http.ResponseWriter, key string) (string, bool) {
+	key = strings.TrimSpace(key)
+	if err := once.ValidateKey(key); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid key")
+		return "", false
+	}
+	return key, true
+}
+
+func (h *Handler) auth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if h.authToken == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		const prefix = "Bearer "
+		header := r.Header.Get("Authorization")
+		if !strings.HasPrefix(header, prefix) {
+			writeError(w, http.StatusUnauthorized, "missing bearer token")
+			return
+		}
+		token := strings.TrimPrefix(header, prefix)
+		if subtle.ConstantTimeCompare([]byte(token), []byte(h.authToken)) != 1 {
+			writeError(w, http.StatusUnauthorized, "invalid bearer token")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func modelRecord(rec once.Record) recordModel {

@@ -159,6 +159,28 @@ func TestStoreWithoutCommandDoesNotPanic(t *testing.T) {
 	}
 }
 
+func TestServeRejectsRemoteWithoutExplicitFlag(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := Run([]string{"serve", "--listen", "0.0.0.0:7410"}, &out, &errOut)
+	if code != 2 {
+		t.Fatalf("code = %d", code)
+	}
+	if !strings.Contains(errOut.String(), "requires --allow-remote") {
+		t.Fatalf("stderr = %q", errOut.String())
+	}
+}
+
+func TestServeRejectsUnsafeNoAuthOnRemote(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := Run([]string{"serve", "--listen", "0.0.0.0:7410", "--allow-remote", "--unsafe-no-auth"}, &out, &errOut)
+	if code != 2 {
+		t.Fatalf("code = %d", code)
+	}
+	if !strings.Contains(errOut.String(), "only allowed on loopback") {
+		t.Fatalf("stderr = %q", errOut.String())
+	}
+}
+
 func shell() string {
 	if runtime.GOOS == "windows" {
 		if comspec := os.Getenv("ComSpec"); comspec != "" {

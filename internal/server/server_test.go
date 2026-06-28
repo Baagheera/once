@@ -22,8 +22,12 @@ func TestReserveCommitAndGet(t *testing.T) {
 	if !jsonBool(t, res.Body.Bytes(), "fresh") {
 		t.Fatal("first reserve should be fresh")
 	}
+	attempt := jsonString(t, res.Body.Bytes(), "attempt_token")
+	if attempt == "" {
+		t.Fatal("missing attempt token")
+	}
 
-	res = request(t, handler, "POST", "/v1/commit", `{"key":"demo","state":"succeeded","exit_code":0,"stdout_b64":"b2sK"}`)
+	res = request(t, handler, "POST", "/v1/commit", `{"key":"demo","attempt_token":"`+attempt+`","state":"succeeded","exit_code":0,"stdout_b64":"b2sK"}`)
 	if res.Code != http.StatusOK {
 		t.Fatalf("commit status = %d body = %s", res.Code, res.Body.String())
 	}
@@ -75,7 +79,8 @@ func TestDuplicateCommitIsIdempotent(t *testing.T) {
 	if res.Code != http.StatusOK {
 		t.Fatalf("reserve status = %d body = %s", res.Code, res.Body.String())
 	}
-	body := `{"key":"demo","state":"succeeded","exit_code":0,"stdout_b64":"b2sK"}`
+	attempt := jsonString(t, res.Body.Bytes(), "attempt_token")
+	body := `{"key":"demo","attempt_token":"` + attempt + `","state":"succeeded","exit_code":0,"stdout_b64":"b2sK"}`
 	res = request(t, handler, "POST", "/v1/commit", body)
 	if res.Code != http.StatusOK {
 		t.Fatalf("commit status = %d body = %s", res.Code, res.Body.String())
@@ -93,11 +98,12 @@ func TestDuplicateCommitConflict(t *testing.T) {
 	if res.Code != http.StatusOK {
 		t.Fatalf("reserve status = %d body = %s", res.Code, res.Body.String())
 	}
-	res = request(t, handler, "POST", "/v1/commit", `{"key":"demo","state":"succeeded","exit_code":0,"stdout_b64":"b2sK"}`)
+	attempt := jsonString(t, res.Body.Bytes(), "attempt_token")
+	res = request(t, handler, "POST", "/v1/commit", `{"key":"demo","attempt_token":"`+attempt+`","state":"succeeded","exit_code":0,"stdout_b64":"b2sK"}`)
 	if res.Code != http.StatusOK {
 		t.Fatalf("commit status = %d body = %s", res.Code, res.Body.String())
 	}
-	res = request(t, handler, "POST", "/v1/commit", `{"key":"demo","state":"succeeded","exit_code":0,"stdout_b64":"bm8K"}`)
+	res = request(t, handler, "POST", "/v1/commit", `{"key":"demo","attempt_token":"`+attempt+`","state":"succeeded","exit_code":0,"stdout_b64":"bm8K"}`)
 	if res.Code != http.StatusConflict {
 		t.Fatalf("duplicate commit status = %d body = %s", res.Code, res.Body.String())
 	}
@@ -106,7 +112,11 @@ func TestDuplicateCommitConflict(t *testing.T) {
 func TestCommitWithoutReserveReturnsNotFound(t *testing.T) {
 	handler := newTestHandler(t)
 
-	res := request(t, handler, "POST", "/v1/commit", `{"key":"demo","state":"succeeded","exit_code":0}`)
+	attempt, err := once.NewAttemptToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := request(t, handler, "POST", "/v1/commit", `{"key":"demo","attempt_token":"`+attempt+`","state":"succeeded","exit_code":0}`)
 	if res.Code != http.StatusNotFound {
 		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
 	}
@@ -119,13 +129,48 @@ func TestDeleteRunningNeedsForce(t *testing.T) {
 	if res.Code != http.StatusOK {
 		t.Fatalf("reserve status = %d body = %s", res.Code, res.Body.String())
 	}
+	attempt := jsonString(t, res.Body.Bytes(), "attempt_token")
 	res = request(t, handler, "DELETE", "/v1/records/demo", "")
 	if res.Code != http.StatusConflict {
 		t.Fatalf("delete status = %d body = %s", res.Code, res.Body.String())
 	}
-	res = request(t, handler, "DELETE", "/v1/records/demo?force=1", "")
+	res = requestWithAttempt(t, handler, "DELETE", "/v1/records/demo?force=1", "", attempt)
 	if res.Code != http.StatusNoContent {
 		t.Fatalf("force delete status = %d body = %s", res.Code, res.Body.String())
+	}
+}
+
+func TestUnauthorizedRequestsAreRejected(t *testing.T) {
+	store, err := once.OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	handler := NewHandler(store, Options{AuthToken: "secret"})
+
+	req := httptest.NewRequest("GET", "/v1/records/demo", nil)
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+}
+
+func TestRejectsTrailingJSON(t *testing.T) {
+	handler := newTestHandler(t)
+
+	res := request(t, handler, "POST", "/v1/reserve", `{"key":"demo"}{"key":"other"}`)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+}
+
+func TestRejectsInvalidKey(t *testing.T) {
+	handler := newTestHandler(t)
+
+	res := request(t, handler, "POST", "/v1/reserve", `{"key":"bad/key"}`)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
 	}
 }
 
@@ -150,7 +195,7 @@ func newTestHandler(t *testing.T) http.Handler {
 			t.Fatal(err)
 		}
 	})
-	return NewHandler(store)
+	return NewHandler(store, Options{AuthToken: "test-token"})
 }
 
 func request(t *testing.T, handler http.Handler, method, path, body string) *httptest.ResponseRecorder {
@@ -160,6 +205,21 @@ func request(t *testing.T, handler http.Handler, method, path, body string) *htt
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	req.Header.Set("Authorization", "Bearer test-token")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	return res
+}
+
+func requestWithAttempt(t *testing.T, handler http.Handler, method, path, body, attempt string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("X-Once-Attempt-Token", attempt)
 	res := httptest.NewRecorder()
 	handler.ServeHTTP(res, req)
 	return res
@@ -175,6 +235,20 @@ func jsonBool(t *testing.T, data []byte, field string) bool {
 	value, ok := doc[field].(bool)
 	if !ok {
 		t.Fatalf("%q is not a bool in %s", field, string(data))
+	}
+	return value
+}
+
+func jsonString(t *testing.T, data []byte, field string) string {
+	t.Helper()
+
+	var doc map[string]any
+	if err := json.NewDecoder(bytes.NewReader(data)).Decode(&doc); err != nil {
+		t.Fatal(err)
+	}
+	value, ok := doc[field].(string)
+	if !ok {
+		t.Fatalf("%q is not a string in %s", field, string(data))
 	}
 	return value
 }

@@ -11,7 +11,7 @@ var (
 type Store interface {
 	Close() error
 	Reserve(key string, command []string) (Record, bool, error)
-	Commit(key string, state State, exitCode int, stdout, stderr []byte, runErr string) (Record, error)
+	Commit(key, attempt string, state State, exitCode int, stdout, stderr []byte, runErr string) (Record, error)
 	Get(key string) (Record, error)
-	Forget(key string, force bool) (bool, error)
+	Forget(key string, force bool, attempt string) (bool, error)
 }

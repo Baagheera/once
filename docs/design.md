@@ -10,6 +10,11 @@ command again.
 The same key with a different command is rejected. This catches a common class
 of accidental key reuse bugs early.
 
+Each fresh reservation also gets an opaque attempt token. The token is stored
+only as a hash and is required to commit the result. This prevents a different
+client that merely knows the key from finalizing someone else's in-flight
+operation.
+
 The hard case is a process that dies after the side effect happened but before
 the row is committed. once does not guess. The row remains `running`.
 
@@ -36,3 +41,6 @@ owns the idempotency record.
 HTTP commit is idempotent when the repeated commit contains the same terminal
 result. A repeated commit with different output, state or exit code is a
 conflict.
+
+HTTP mode requires bearer authentication by default. The default listener is
+loopback, and non-loopback listeners require `--allow-remote`.

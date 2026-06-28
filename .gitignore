@@ -3,6 +3,9 @@
 *.db-shm
 *.db-wal
 
+# Local CodeGraph index.
+.codegraph/
+
 # Local build outputs.
 /once
 /once.exe
