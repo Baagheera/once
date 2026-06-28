@@ -7,8 +7,9 @@ once serve --listen 127.0.0.1:7410
 ```
 
 By default, the server creates `once.db.token` and prints only the token file
-path. Read that file, pass `--token-file`, or set `ONCE_TOKEN` for scripted
-use. Explicit `--token` values must be at least 32 characters.
+path. Read that file, or pass `--token-file` for scripted use. Tokens passed
+through flags or environment variables can be visible to other local processes
+on shared machines. Explicit `--token` values must be at least 32 characters.
 
 All endpoints except `GET /healthz` require:
 
