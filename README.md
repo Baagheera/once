@@ -92,6 +92,18 @@ It keeps the key in `running` so the uncertainty is visible instead of hidden.
 This is still useful. The common case becomes safe to retry, and the bad case
 becomes a record you can inspect.
 
+## Current limitations
+
+`once run` is intended for finite, non-interactive commands.
+
+Today it buffers stdout and stderr in memory before storing them, so output is
+not streamed live and very large output is not a good fit yet. It also does not
+pass stdin to the child process.
+
+The command line is stored to catch accidental key reuse, but once cannot infer
+changes in environment variables, input files, remote state, or other context
+outside the command arguments. Put that identity in the key today.
+
 ## Commands
 
 ```sh
