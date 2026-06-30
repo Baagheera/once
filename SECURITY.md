@@ -4,8 +4,16 @@
 
 once is experimental.
 
-Security fixes are applied to `main` and to the latest `v0.1.x` release when
-practical. The public API and storage format may still change before `v1.0.0`.
+Security fixes are applied to `main` and to the latest released minor line when
+practical.
+
+Currently supported:
+
+- `main`
+- latest `v0.2.x`
+
+Older experimental releases may be superseded instead of patched. The public API
+and storage format may still change before `v1.0.0`.
 
 ## Reporting a vulnerability
 
