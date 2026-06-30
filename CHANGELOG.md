@@ -4,6 +4,10 @@ User-facing changes are recorded here as releases are prepared.
 
 ## Unreleased
 
+No unreleased changes.
+
+## v0.2.0 - 2026-06-30
+
 ### Added
 
 - Contribution guidelines and GitHub issue templates.
