@@ -1,0 +1,43 @@
+name: Bug report
+description: Report behavior that looks wrong in once.
+labels:
+  - bug
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the behavior and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Include commands, inputs, and relevant output. Redact bearer tokens, attempt tokens, sensitive keys, command arguments, stdout, stderr, errors, and Authorization or X-Once-Attempt-Token headers. Do not attach SQLite database files or WAL/SHM sidecars.
+      placeholder: |
+        once --store /tmp/once.db run --key demo -- ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Include the once version or commit SHA.
+      placeholder: v0.1.1
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, shell, Go version, filesystem, and anything unusual about SQLite storage.
+    validations:
+      required: false
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Add redacted logs or notes that help explain the failure.
+    validations:
+      required: false
