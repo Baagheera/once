@@ -2,6 +2,8 @@ package cli
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -235,6 +237,127 @@ func TestRunStoresAndReplaysLargeStdout(t *testing.T) {
 	}
 }
 
+func TestListShowsRecords(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "run", "--key", "done", "--", shell(), shellFlag(), "echo ok"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("run code = %d stderr = %s", code, errOut.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"--store", storePath, "run", "--key", "bad", "--", shell(), shellFlag(), failScript()}, &out, &errOut)
+	if code != 9 {
+		t.Fatalf("fail run code = %d stderr = %s", code, errOut.String())
+	}
+
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Reserve("stuck", []string{"send", "email"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"--store", storePath, "list"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("list code = %d stderr = %s", code, errOut.String())
+	}
+	listed := out.String()
+	for _, want := range []string{"KEY", "STATE", "EXIT", "UPDATED", "COMMAND", "done", "succeeded", "bad", "failed", "stuck", "running"} {
+		if !strings.Contains(listed, want) {
+			t.Fatalf("list output missing %q:\n%s", want, listed)
+		}
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"--store", storePath, "list", "--state", "running", "--limit", "1"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("filtered list code = %d stderr = %s", code, errOut.String())
+	}
+	filtered := out.String()
+	if !strings.Contains(filtered, "stuck") || strings.Contains(filtered, "done") || strings.Contains(filtered, "bad") {
+		t.Fatalf("filtered list output = %q", filtered)
+	}
+}
+
+func TestExportJSONLRedactsOutputByDefault(t *testing.T) {
+	t.Setenv("ONCE_TEST_HELPER", "1")
+
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	cmd := helperCommand("stdout", "6")
+
+	var out, errOut bytes.Buffer
+	code := Run(append([]string{"--store", storePath, "run", "--key", "demo", "--"}, cmd...), &out, &errOut)
+	if code != 0 {
+		t.Fatalf("run code = %d stderr = %s", code, errOut.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"--store", storePath, "export"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("export code = %d stderr = %s", code, errOut.String())
+	}
+	docs := decodeExport(t, out.String())
+	if len(docs) != 1 {
+		t.Fatalf("exported records = %d, want 1", len(docs))
+	}
+	if docs[0]["key"] != "demo" || docs[0]["state"] != "succeeded" {
+		t.Fatalf("export doc = %#v", docs[0])
+	}
+	if _, ok := docs[0]["stdout_b64"]; ok {
+		t.Fatalf("stdout_b64 should be omitted by default: %#v", docs[0])
+	}
+	if _, ok := docs[0]["stderr_b64"]; ok {
+		t.Fatalf("stderr_b64 should be omitted by default: %#v", docs[0])
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"--store", storePath, "export", "--include-output"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("export --include-output code = %d stderr = %s", code, errOut.String())
+	}
+	docs = decodeExport(t, out.String())
+	if docs[0]["stdout_b64"] != base64.StdEncoding.EncodeToString([]byte("xxxxxx")) {
+		t.Fatalf("stdout_b64 = %#v", docs[0]["stdout_b64"])
+	}
+	if value, ok := docs[0]["stderr_b64"]; !ok || value != "" {
+		t.Fatalf("stderr_b64 = %#v, present=%v", value, ok)
+	}
+}
+
+func TestListAndExportRejectInvalidFilters(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "list", "--state", "waiting"}, &out, &errOut)
+	if code != 2 {
+		t.Fatalf("list code = %d", code)
+	}
+	if !strings.Contains(errOut.String(), "--state") {
+		t.Fatalf("list stderr = %q", errOut.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"--store", storePath, "export", "--limit", "-1"}, &out, &errOut)
+	if code != 2 {
+		t.Fatalf("export code = %d", code)
+	}
+	if !strings.Contains(errOut.String(), "--limit") {
+		t.Fatalf("export stderr = %q", errOut.String())
+	}
+}
+
 func TestForgetRunningNeedsForce(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "once.db")
 	store, err := once.OpenSQLite(storePath)
@@ -460,4 +583,22 @@ func TestHelperProcess(t *testing.T) {
 	default:
 		os.Exit(2)
 	}
+}
+
+func decodeExport(t *testing.T, output string) []map[string]any {
+	t.Helper()
+
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	var docs []map[string]any
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		var doc map[string]any
+		if err := json.Unmarshal([]byte(line), &doc); err != nil {
+			t.Fatalf("decode %q: %v", line, err)
+		}
+		docs = append(docs, doc)
+	}
+	return docs
 }

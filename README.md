@@ -44,6 +44,7 @@ For local development:
 ```sh
 go run ./cmd/once run --key demo -- echo hello
 go run ./cmd/once run --key demo -- echo hello
+go run ./cmd/once list
 go run ./cmd/once status demo
 go run ./cmd/once get demo
 ```
@@ -132,6 +133,8 @@ once run --key KEY -- COMMAND [ARG...]
 once serve [--listen ADDR] [--token-file PATH]
 once status KEY
 once get KEY
+once list [--state STATE] [--limit N]
+once export [--state STATE] [--limit N] [--include-output]
 once forget [--force] KEY
 ```
 
@@ -140,6 +143,11 @@ Global flags:
 ```sh
 --store PATH    SQLite database path. Default: once.db
 ```
+
+`list` prints a local summary of records for operators. `export` writes JSONL,
+one record per line, for scripts and audit trails. It omits stored stdout and
+stderr by default; use `--include-output` only when those bytes are safe to
+handle.
 
 ## HTTP mode
 

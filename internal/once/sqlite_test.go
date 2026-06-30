@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestReserveCommitAndReplay(t *testing.T) {
@@ -313,6 +314,115 @@ func TestConcurrentReserveAcrossStoresOnlyOneFresh(t *testing.T) {
 
 	if freshCount != 1 {
 		t.Fatalf("freshCount = %d, want 1", freshCount)
+	}
+}
+
+func TestListFiltersAndLimitsRecords(t *testing.T) {
+	store, err := OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	rec, _, err := store.Reserve("done", []string{"echo", "ok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit("done", rec.Attempt, Succeeded, 0, []byte("ok\n"), nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Reserve("stuck", []string{"send", "email"}); err != nil {
+		t.Fatal(err)
+	}
+
+	records, err := store.List(ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("len(records) = %d, want 2", len(records))
+	}
+	for _, rec := range records {
+		if len(rec.Stdout) != 0 || len(rec.Stderr) != 0 {
+			t.Fatalf("default List returned output for %s", rec.Key)
+		}
+	}
+
+	records, err = store.List(ListOptions{State: Running})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].Key != "stuck" {
+		t.Fatalf("running records = %#v, want stuck", records)
+	}
+
+	records, err = store.List(ListOptions{Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("limited len = %d, want 1", len(records))
+	}
+
+	if _, err := store.List(ListOptions{State: State("other")}); err == nil {
+		t.Fatal("expected invalid state error")
+	}
+	if _, err := store.List(ListOptions{Limit: -1}); err == nil {
+		t.Fatal("expected invalid limit error")
+	}
+
+	records, err = store.List(ListOptions{IncludeOutput: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var foundDone bool
+	for _, rec := range records {
+		if rec.Key == "done" {
+			foundDone = true
+			if string(rec.Stdout) != "ok\n" {
+				t.Fatalf("stdout = %q, want ok", rec.Stdout)
+			}
+		}
+	}
+	if !foundDone {
+		t.Fatal("missing done record")
+	}
+}
+
+func TestListOrdersByParsedUpdatedAt(t *testing.T) {
+	store, err := OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	base := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	older := base.Add(100 * time.Millisecond)
+	newer := base.Add(110 * time.Millisecond)
+	for _, row := range []struct {
+		key string
+		at  time.Time
+	}{
+		{key: "older", at: older},
+		{key: "newer", at: newer},
+	} {
+		if _, err := store.db.Exec(`
+INSERT INTO once_records (key, attempt_hash, state, command, started_at, updated_at)
+VALUES (?, ?, 'running', '[]', ?, ?)
+`, row.key, row.key+"-attempt", formatTime(row.at), formatTime(row.at)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	records, err := store.List(ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("len(records) = %d, want 2", len(records))
+	}
+	if records[0].Key != "newer" || records[1].Key != "older" {
+		t.Fatalf("order = %s, %s; want newer, older", records[0].Key, records[1].Key)
 	}
 }
 

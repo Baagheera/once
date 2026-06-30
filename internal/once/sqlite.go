@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -227,27 +228,7 @@ FROM once_records
 WHERE key = ?
 `, key)
 
-	var rec Record
-	var state string
-	var attemptHash string
-	var commandJSON string
-	var startedAt string
-	var finishedAt sql.NullString
-	var updatedAt string
-
-	err := row.Scan(
-		&rec.Key,
-		&attemptHash,
-		&state,
-		&rec.ExitCode,
-		&rec.Stdout,
-		&rec.Stderr,
-		&rec.Error,
-		&commandJSON,
-		&startedAt,
-		&finishedAt,
-		&updatedAt,
-	)
+	rec, err := scanRecord(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Record{}, ErrNotFound
 	}
@@ -255,26 +236,58 @@ WHERE key = ?
 		return Record{}, err
 	}
 
-	rec.State = State(state)
-	rec.Attempt = attemptHash
-	if err := json.Unmarshal([]byte(commandJSON), &rec.Command); err != nil {
-		return Record{}, err
+	return rec, nil
+}
+
+func (s *SQLiteStore) List(opts ListOptions) ([]Record, error) {
+	if opts.Limit < 0 {
+		return nil, fmt.Errorf("limit must be non-negative")
 	}
-	if rec.StartedAt, err = parseTime(startedAt); err != nil {
-		return Record{}, err
-	}
-	if finishedAt.Valid {
-		t, err := parseTime(finishedAt.String)
-		if err != nil {
-			return Record{}, err
-		}
-		rec.FinishedAt = &t
-	}
-	if rec.UpdatedAt, err = parseTime(updatedAt); err != nil {
-		return Record{}, err
+	if opts.State != "" && opts.State != Running && opts.State != Succeeded && opts.State != Failed {
+		return nil, fmt.Errorf("invalid state: %s", opts.State)
 	}
 
-	return rec, nil
+	outputColumns := "X'' AS stdout, X'' AS stderr"
+	if opts.IncludeOutput {
+		outputColumns = "stdout, stderr"
+	}
+	query := `
+SELECT key, attempt_hash, state, exit_code, ` + outputColumns + `, error, command, started_at, finished_at, updated_at
+FROM once_records
+`
+	var args []any
+	if opts.State != "" {
+		query += "WHERE state = ?\n"
+		args = append(args, string(opts.State))
+	}
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var records []Record
+	for rows.Next() {
+		rec, err := scanRecord(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].UpdatedAt.Equal(records[j].UpdatedAt) {
+			return records[i].Key < records[j].Key
+		}
+		return records[i].UpdatedAt.After(records[j].UpdatedAt)
+	})
+	if opts.Limit > 0 && len(records) > opts.Limit {
+		records = records[:opts.Limit]
+	}
+	return records, nil
 }
 
 func (s *SQLiteStore) Forget(key string, force bool, attempt string) (bool, error) {
@@ -369,6 +382,58 @@ func formatTime(t time.Time) string {
 
 func parseTime(s string) (time.Time, error) {
 	return time.Parse(time.RFC3339Nano, s)
+}
+
+type recordScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanRecord(scanner recordScanner) (Record, error) {
+	var rec Record
+	var state string
+	var attemptHash string
+	var commandJSON string
+	var startedAt string
+	var finishedAt sql.NullString
+	var updatedAt string
+
+	err := scanner.Scan(
+		&rec.Key,
+		&attemptHash,
+		&state,
+		&rec.ExitCode,
+		&rec.Stdout,
+		&rec.Stderr,
+		&rec.Error,
+		&commandJSON,
+		&startedAt,
+		&finishedAt,
+		&updatedAt,
+	)
+	if err != nil {
+		return Record{}, err
+	}
+
+	rec.State = State(state)
+	rec.Attempt = attemptHash
+	if err := json.Unmarshal([]byte(commandJSON), &rec.Command); err != nil {
+		return Record{}, err
+	}
+	if rec.StartedAt, err = parseTime(startedAt); err != nil {
+		return Record{}, err
+	}
+	if finishedAt.Valid {
+		t, err := parseTime(finishedAt.String)
+		if err != nil {
+			return Record{}, err
+		}
+		rec.FinishedAt = &t
+	}
+	if rec.UpdatedAt, err = parseTime(updatedAt); err != nil {
+		return Record{}, err
+	}
+
+	return rec, nil
 }
 
 func restrictSQLiteFiles(path string) error {

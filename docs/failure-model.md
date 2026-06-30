@@ -154,6 +154,8 @@ not available from once. The record remains `running`.
 Use the smallest repair that matches what you know:
 
 ```sh
+once list --state running
+once export --state running
 once status KEY
 once get KEY
 once forget KEY

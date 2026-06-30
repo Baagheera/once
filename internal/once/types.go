@@ -23,3 +23,9 @@ type Record struct {
 	FinishedAt *time.Time
 	UpdatedAt  time.Time
 }
+
+type ListOptions struct {
+	State         State
+	Limit         int
+	IncludeOutput bool
+}
