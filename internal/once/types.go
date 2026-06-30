@@ -29,3 +29,14 @@ type ListOptions struct {
 	Limit         int
 	IncludeOutput bool
 }
+
+type PruneOptions struct {
+	State  State
+	Cutoff time.Time
+	Force  bool
+}
+
+type PruneResult struct {
+	Records []Record
+	Deleted int
+}

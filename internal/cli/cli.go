@@ -57,6 +57,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return listCommand(args[1:], storePath, stdout, stderr)
 	case "export":
 		return exportCommand(args[1:], storePath, stdout, stderr)
+	case "prune":
+		return pruneCommand(args[1:], storePath, stdout, stderr)
 	case "forget":
 		return forgetCommand(args[1:], storePath, stdout, stderr)
 	case "help", "-h", "--help":
@@ -293,6 +295,64 @@ func exportCommand(args []string, storePath string, stdout, stderr io.Writer) in
 	return 0
 }
 
+func pruneCommand(args []string, storePath string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("prune", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	stateFlag := fs.String("state", "", "state to prune: succeeded or failed")
+	olderThanFlag := fs.String("older-than", "", "prune records older than this duration")
+	force := fs.Bool("force", false, "delete matching records; otherwise show a dry run")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "once: prune does not take positional arguments")
+		return 2
+	}
+
+	opts, ok := pruneOptions(*stateFlag, *olderThanFlag, *force, time.Now().UTC(), stderr)
+	if !ok {
+		return 2
+	}
+
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		fmt.Fprintf(stderr, "once: open store: %v\n", err)
+		return 1
+	}
+	defer store.Close()
+
+	result, err := store.Prune(opts)
+	if err != nil {
+		fmt.Fprintf(stderr, "once: prune: %v\n", err)
+		return 1
+	}
+
+	if opts.Force {
+		fmt.Fprintf(stdout, "pruned %d %s\n", result.Deleted, recordLabel(result.Deleted))
+		return 0
+	}
+
+	fmt.Fprintf(stdout, "would prune %d %s\n", len(result.Records), recordLabel(len(result.Records)))
+	if len(result.Records) == 0 {
+		return 0
+	}
+	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "KEY\tSTATE\tUPDATED\tCOMMAND")
+	for _, rec := range result.Records {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n",
+			rec.Key,
+			rec.State,
+			rec.UpdatedAt.Format(time.RFC3339),
+			formatCommand(rec.Command),
+		)
+	}
+	if err := tw.Flush(); err != nil {
+		fmt.Fprintf(stderr, "once: prune: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
 func forgetCommand(args []string, storePath string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("forget", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -385,6 +445,58 @@ func listOptions(state string, limit int, stderr io.Writer) (once.ListOptions, b
 		return once.ListOptions{}, false
 	}
 	return opts, true
+}
+
+func pruneOptions(state string, olderThan string, force bool, now time.Time, stderr io.Writer) (once.PruneOptions, bool) {
+	opts := once.PruneOptions{Force: force}
+	switch strings.TrimSpace(state) {
+	case string(once.Succeeded):
+		opts.State = once.Succeeded
+	case string(once.Failed):
+		opts.State = once.Failed
+	default:
+		fmt.Fprintln(stderr, "once: --state must be succeeded or failed")
+		return once.PruneOptions{}, false
+	}
+
+	age, err := parsePruneDuration(olderThan)
+	if err != nil || age <= 0 {
+		fmt.Fprintln(stderr, "once: --older-than must be a positive duration")
+		return once.PruneOptions{}, false
+	}
+	opts.Cutoff = now.UTC().Add(-age)
+	return opts, true
+}
+
+func parsePruneDuration(value string) (time.Duration, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, fmt.Errorf("empty duration")
+	}
+	if duration, err := time.ParseDuration(value); err == nil {
+		return duration, nil
+	}
+	if strings.HasSuffix(value, "d") {
+		days, err := strconv.ParseInt(strings.TrimSuffix(value, "d"), 10, 32)
+		if err != nil {
+			return 0, err
+		}
+		if days <= 0 {
+			return 0, fmt.Errorf("duration must be positive")
+		}
+		if days > 106751 {
+			return 0, fmt.Errorf("duration too large")
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+	return 0, fmt.Errorf("invalid duration")
+}
+
+func recordLabel(n int) string {
+	if n == 1 {
+		return "record"
+	}
+	return "records"
 }
 
 type recordJSON struct {
@@ -580,6 +692,7 @@ func usage(w io.Writer) {
 		"  once [--store PATH] get KEY",
 		"  once [--store PATH] list [--state STATE] [--limit N]",
 		"  once [--store PATH] export [--state STATE] [--limit N] [--include-output]",
+		"  once [--store PATH] prune --state STATE --older-than DURATION [--force]",
 		"  once [--store PATH] forget [--force] KEY",
 	}
 	fmt.Fprintln(w, strings.Join(lines, "\n"))

@@ -135,6 +135,7 @@ once status KEY
 once get KEY
 once list [--state STATE] [--limit N]
 once export [--state STATE] [--limit N] [--include-output]
+once prune --state STATE --older-than DURATION [--force]
 once forget [--force] KEY
 ```
 
@@ -148,6 +149,11 @@ Global flags:
 one record per line, for scripts and audit trails. It omits stored stdout and
 stderr by default; use `--include-output` only when those bytes are safe to
 handle.
+
+`prune` finds terminal records updated more than `DURATION` ago in the local
+store. It requires `--state succeeded` or `--state failed`; durations can use
+Go syntax such as `24h` or day syntax such as `30d`. Without `--force` it only
+prints the records it would delete.
 
 ## HTTP mode
 
