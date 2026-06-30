@@ -388,6 +388,117 @@ func TestForgetRunningNeedsForce(t *testing.T) {
 	}
 }
 
+func TestPruneDryRunThenForce(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "run", "--key", "done", "--", shell(), shellFlag(), "echo ok"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("run code = %d stderr = %s", code, errOut.String())
+	}
+
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Reserve("stuck", []string{"send", "email"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"--store", storePath, "prune", "--state", "succeeded", "--older-than", "1ns"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("dry-run prune code = %d stderr = %s", code, errOut.String())
+	}
+	dryRun := out.String()
+	if !strings.Contains(dryRun, "would prune 1 record") || !strings.Contains(dryRun, "done") {
+		t.Fatalf("dry-run output = %q", dryRun)
+	}
+	if strings.Contains(dryRun, "stuck") {
+		t.Fatalf("dry-run output included running record: %q", dryRun)
+	}
+
+	store, err = once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Get("done"); err != nil {
+		t.Fatalf("dry run removed done: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"--store", storePath, "prune", "--state", "succeeded", "--older-than", "1ns", "--force"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("force prune code = %d stderr = %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "pruned 1 record") {
+		t.Fatalf("force output = %q", out.String())
+	}
+
+	store, err = once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.Get("done"); err != once.ErrNotFound {
+		t.Fatalf("done err = %v, want ErrNotFound", err)
+	}
+	if _, err := store.Get("stuck"); err != nil {
+		t.Fatalf("stuck err = %v, want record to remain", err)
+	}
+}
+
+func TestPruneRejectsInvalidFilters(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "prune", "--state", "running", "--older-than", "1h"}, &out, &errOut)
+	if code != 2 {
+		t.Fatalf("running prune code = %d", code)
+	}
+	if !strings.Contains(errOut.String(), "--state") {
+		t.Fatalf("running prune stderr = %q", errOut.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"--store", storePath, "prune", "--state", "succeeded"}, &out, &errOut)
+	if code != 2 {
+		t.Fatalf("missing age code = %d", code)
+	}
+	if !strings.Contains(errOut.String(), "--older-than") {
+		t.Fatalf("missing age stderr = %q", errOut.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"--store", storePath, "prune", "--state", "failed", "--older-than", "0d"}, &out, &errOut)
+	if code != 2 {
+		t.Fatalf("zero age code = %d", code)
+	}
+	if !strings.Contains(errOut.String(), "--older-than") {
+		t.Fatalf("zero age stderr = %q", errOut.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"--store", storePath, "prune", "--state", "failed", "--older-than", "-1571175806d"}, &out, &errOut)
+	if code != 2 {
+		t.Fatalf("negative wrapped age code = %d", code)
+	}
+	if !strings.Contains(errOut.String(), "--older-than") {
+		t.Fatalf("negative wrapped age stderr = %q", errOut.String())
+	}
+}
+
 func TestStoreWithoutCommandDoesNotPanic(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := Run([]string{"--store", filepath.Join(t.TempDir(), "once.db")}, &out, &errOut)

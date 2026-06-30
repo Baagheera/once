@@ -158,12 +158,18 @@ once list --state running
 once export --state running
 once status KEY
 once get KEY
+once prune --state succeeded --older-than 30d
+once prune --state succeeded --older-than 30d --force
 once forget KEY
 once forget --force KEY
 ```
 
 `forget` without `--force` deletes terminal records. `forget --force` can also
 delete `running` records, and should be treated as an explicit operator action.
+
+`prune` is a dry run unless `--force` is set. It is for old terminal records
+only and does not delete `running` records; those still need a deliberate repair
+decision.
 
 Before force-deleting a `running` record, answer two questions outside once:
 

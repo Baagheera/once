@@ -4,7 +4,9 @@ User-facing changes are recorded here as releases are prepared.
 
 ## Unreleased
 
-No unreleased changes.
+### Added
+
+- CLI `prune` command for dry-run and forced cleanup of old terminal records.
 
 ## v0.2.0 - 2026-06-30
 

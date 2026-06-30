@@ -426,6 +426,86 @@ VALUES (?, ?, 'running', '[]', ?, ?)
 	}
 }
 
+func TestPruneDeletesOnlyOldTerminalRecords(t *testing.T) {
+	store, err := OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-48 * time.Hour)
+	recent := now.Add(-2 * time.Hour)
+	cutoff := now.Add(-24 * time.Hour)
+
+	for _, row := range []struct {
+		key   string
+		state State
+		at    time.Time
+	}{
+		{key: "old-success", state: Succeeded, at: old},
+		{key: "recent-success", state: Succeeded, at: recent},
+		{key: "old-failure", state: Failed, at: old},
+		{key: "old-running", state: Running, at: old},
+	} {
+		finishedAt := any(nil)
+		if row.state != Running {
+			finishedAt = formatTime(row.at)
+		}
+		if _, err := store.db.Exec(`
+INSERT INTO once_records (key, attempt_hash, state, exit_code, command, started_at, finished_at, updated_at)
+VALUES (?, ?, ?, 0, '[]', ?, ?, ?)
+`, row.key, row.key+"-attempt", string(row.state), formatTime(row.at), finishedAt, formatTime(row.at)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	dryRun, err := store.Prune(PruneOptions{State: Succeeded, Cutoff: cutoff})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dryRun.Deleted != 0 {
+		t.Fatalf("dry run deleted = %d, want 0", dryRun.Deleted)
+	}
+	if len(dryRun.Records) != 1 || dryRun.Records[0].Key != "old-success" {
+		t.Fatalf("dry run records = %#v, want old-success", dryRun.Records)
+	}
+	if _, err := store.Get("old-success"); err != nil {
+		t.Fatalf("dry run deleted old-success: %v", err)
+	}
+
+	result, err := store.Prune(PruneOptions{State: Succeeded, Cutoff: cutoff, Force: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Deleted != 1 {
+		t.Fatalf("deleted = %d, want 1", result.Deleted)
+	}
+	if _, err := store.Get("old-success"); err != ErrNotFound {
+		t.Fatalf("old-success err = %v, want ErrNotFound", err)
+	}
+	for _, key := range []string{"recent-success", "old-failure", "old-running"} {
+		if _, err := store.Get(key); err != nil {
+			t.Fatalf("%s err = %v, want record to remain", key, err)
+		}
+	}
+}
+
+func TestPruneRejectsRunningState(t *testing.T) {
+	store, err := OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if _, err := store.Prune(PruneOptions{State: Running, Cutoff: time.Now()}); err == nil {
+		t.Fatal("expected running prune to be rejected")
+	}
+	if _, err := store.Prune(PruneOptions{State: Succeeded}); err == nil {
+		t.Fatal("expected missing cutoff error")
+	}
+}
+
 func TestReserveFailsWhenDatabaseIsLocked(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "once.db")
 	store, err := OpenSQLite(path)

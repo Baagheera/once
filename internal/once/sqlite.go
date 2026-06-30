@@ -2,6 +2,7 @@ package once
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -288,6 +289,117 @@ FROM once_records
 		records = records[:opts.Limit]
 	}
 	return records, nil
+}
+
+func (s *SQLiteStore) Prune(opts PruneOptions) (PruneResult, error) {
+	if opts.State != Succeeded && opts.State != Failed {
+		return PruneResult{}, fmt.Errorf("prune state must be succeeded or failed")
+	}
+	if opts.Cutoff.IsZero() {
+		return PruneResult{}, fmt.Errorf("prune cutoff is required")
+	}
+
+	ctx := context.Background()
+	if opts.Force {
+		return s.pruneForced(ctx, opts)
+	}
+
+	records, err := pruneCandidates(ctx, s.db, opts)
+	if err != nil {
+		return PruneResult{}, err
+	}
+	return PruneResult{Records: records}, nil
+}
+
+type pruneRunner interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func pruneCandidates(ctx context.Context, runner pruneRunner, opts PruneOptions) ([]Record, error) {
+	rows, err := runner.QueryContext(ctx, `
+SELECT key, attempt_hash, state, exit_code, X'' AS stdout, X'' AS stderr, error, command, started_at, finished_at, updated_at
+FROM once_records
+WHERE state = ?
+`, string(opts.State))
+	if err != nil {
+		return nil, err
+	}
+
+	var records []Record
+	for rows.Next() {
+		rec, err := scanRecord(rows)
+		if err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if rec.UpdatedAt.Before(opts.Cutoff) {
+			records = append(records, rec)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].UpdatedAt.Equal(records[j].UpdatedAt) {
+			return records[i].Key < records[j].Key
+		}
+		return records[i].UpdatedAt.Before(records[j].UpdatedAt)
+	})
+	return records, nil
+}
+
+func deletePruneCandidates(ctx context.Context, runner pruneRunner, records []Record) (int, error) {
+	var deleted int
+	for _, rec := range records {
+		res, err := runner.ExecContext(ctx, `
+DELETE FROM once_records
+WHERE key = ? AND state = ? AND updated_at = ?
+`, rec.Key, string(rec.State), formatTime(rec.UpdatedAt))
+		if err != nil {
+			return 0, err
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		deleted += int(affected)
+	}
+	return deleted, nil
+}
+
+func (s *SQLiteStore) pruneForced(ctx context.Context, opts PruneOptions) (PruneResult, error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return PruneResult{}, err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return PruneResult{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
+
+	records, err := pruneCandidates(ctx, conn, opts)
+	if err != nil {
+		return PruneResult{}, err
+	}
+	deleted, err := deletePruneCandidates(ctx, conn, records)
+	if err != nil {
+		return PruneResult{}, err
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return PruneResult{}, err
+	}
+	committed = true
+	return PruneResult{Records: records, Deleted: deleted}, nil
 }
 
 func (s *SQLiteStore) Forget(key string, force bool, attempt string) (bool, error) {
