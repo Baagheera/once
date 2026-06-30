@@ -10,6 +10,7 @@ User-facing changes are recorded here as releases are prepared.
 - A code of conduct for public project participation.
 - A standalone failure model for crash, duplicate-key, token, lock, output, and
   manual-repair cases.
+- CLI `list` and `export` commands for local store inspection.
 
 ### Changed
 
