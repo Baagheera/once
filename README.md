@@ -93,8 +93,9 @@ It keeps the key in `running` so the uncertainty is visible instead of hidden.
 This is still useful. The common case becomes safe to retry, and the bad case
 becomes a record you can inspect.
 
-For concrete crash and repair cases, see
-[`docs/failure-model.md`](docs/failure-model.md).
+For concrete crash cases, see
+[`docs/failure-model.md`](docs/failure-model.md). For operational repair steps,
+see [`docs/repair-cookbook.md`](docs/repair-cookbook.md).
 
 ## When not to use once
 
@@ -154,6 +155,9 @@ handle.
 store. It requires `--state succeeded` or `--state failed`; durations can use
 Go syntax such as `24h` or day syntax such as `30d`. Without `--force` it only
 prints the records it would delete.
+
+For stuck `running` records and terminal cleanup, see the
+[`repair cookbook`](docs/repair-cookbook.md).
 
 ## HTTP mode
 
