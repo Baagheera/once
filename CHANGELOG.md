@@ -6,6 +6,8 @@ User-facing changes are recorded here as releases are prepared.
 
 ### Added
 
+- Repair cookbook for finding stuck records, inspecting keys, deleting
+  uncertain `running` records deliberately, and pruning old terminal records.
 - CLI `prune` command for dry-run and forced cleanup of old terminal records.
 
 ## v0.2.0 - 2026-06-30

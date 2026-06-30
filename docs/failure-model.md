@@ -151,6 +151,9 @@ not available from once. The record remains `running`.
 
 ## Manual repair
 
+For command-by-command operational steps, see
+[`repair-cookbook.md`](repair-cookbook.md).
+
 Use the smallest repair that matches what you know:
 
 ```sh
