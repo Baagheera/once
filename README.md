@@ -92,6 +92,27 @@ It keeps the key in `running` so the uncertainty is visible instead of hidden.
 This is still useful. The common case becomes safe to retry, and the bad case
 becomes a record you can inspect.
 
+For concrete crash and repair cases, see
+[`docs/failure-model.md`](docs/failure-model.md).
+
+## When not to use once
+
+Do not use once as a job queue, scheduler, broker, workflow engine, or
+distributed transaction system. It stores one idempotency record; it does not
+assign work, retry work in the background, or coordinate workers.
+
+Do not use once when you need exactly-once execution against an external
+system. It can replay a stored result, but it cannot prove whether a crashed
+process already changed the outside world.
+
+Avoid `once run` for long-running or interactive jobs. It is intended for
+finite commands; current command-execution limits are listed below.
+
+Treat the SQLite store as sensitive if command arguments, stdout, stderr, error
+strings, or keys can contain secrets. once persists those bytes so it can replay
+the result later. Treat SQLite sidecar files such as `once.db-wal` and
+`once.db-shm` the same way.
+
 ## Current limitations
 
 `once run` is intended for finite, non-interactive commands.

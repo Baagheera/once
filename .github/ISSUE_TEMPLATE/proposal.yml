@@ -1,0 +1,33 @@
+name: Change proposal
+description: Suggest a small change to once.
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What concrete problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the smallest change that would solve the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: fit
+    attributes:
+      label: Fit with once
+      description: Explain why this belongs in a small idempotency log instead of a queue, scheduler, workflow engine, broker, or distributed transaction system.
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks and alternatives
+      description: What could this make more complex, less safe, or harder to explain?
+    validations:
+      required: false
