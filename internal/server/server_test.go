@@ -122,6 +122,47 @@ func TestCommitWithoutReserveReturnsNotFound(t *testing.T) {
 	}
 }
 
+func TestCommitWrongAttemptKeepsRecordRunning(t *testing.T) {
+	handler := newTestHandler(t)
+
+	res := request(t, handler, "POST", "/v1/reserve", `{"key":"demo","command":["send","email"]}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("reserve status = %d body = %s", res.Code, res.Body.String())
+	}
+	attempt := jsonString(t, res.Body.Bytes(), "attempt_token")
+	wrongAttempt, err := once.NewAttemptToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wrongAttempt == attempt {
+		t.Fatal("unexpected token collision")
+	}
+
+	res = request(t, handler, "POST", "/v1/commit", `{"key":"demo","attempt_token":"`+wrongAttempt+`","state":"succeeded","exit_code":0}`)
+	if res.Code != http.StatusConflict {
+		t.Fatalf("wrong-token commit status = %d body = %s", res.Code, res.Body.String())
+	}
+
+	res = request(t, handler, "GET", "/v1/records/demo", "")
+	if res.Code != http.StatusOK {
+		t.Fatalf("get status = %d body = %s", res.Code, res.Body.String())
+	}
+	var rec struct {
+		State once.State `json:"state"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &rec); err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != once.Running {
+		t.Fatalf("state = %s, want %s", rec.State, once.Running)
+	}
+
+	res = request(t, handler, "POST", "/v1/commit", `{"key":"demo","attempt_token":"`+attempt+`","state":"succeeded","exit_code":0}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("correct-token commit status = %d body = %s", res.Code, res.Body.String())
+	}
+}
+
 func TestDeleteRunningNeedsForce(t *testing.T) {
 	handler := newTestHandler(t)
 

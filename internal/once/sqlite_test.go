@@ -1,6 +1,8 @@
 package once
 
 import (
+	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -274,6 +276,80 @@ func TestConcurrentReserveOnlyOneFresh(t *testing.T) {
 
 	if freshCount != 1 {
 		t.Fatalf("freshCount = %d, want 1", freshCount)
+	}
+}
+
+func TestConcurrentReserveAcrossStoresOnlyOneFresh(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "once.db")
+	const storesCount = 8
+
+	stores := make([]*SQLiteStore, storesCount)
+	for i := range stores {
+		store, err := OpenSQLite(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stores[i] = store
+		defer store.Close()
+	}
+
+	var freshCount int64
+	var wg sync.WaitGroup
+	for _, store := range stores {
+		wg.Add(1)
+		go func(store *SQLiteStore) {
+			defer wg.Done()
+			_, fresh, err := store.Reserve("k1", []string{"true"})
+			if err != nil {
+				t.Errorf("Reserve err = %v", err)
+				return
+			}
+			if fresh {
+				atomic.AddInt64(&freshCount, 1)
+			}
+		}(store)
+	}
+	wg.Wait()
+
+	if freshCount != 1 {
+		t.Fatalf("freshCount = %d, want 1", freshCount)
+	}
+}
+
+func TestReserveFailsWhenDatabaseIsLocked(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "once.db")
+	store, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.db.Exec("PRAGMA busy_timeout = 50"); err != nil {
+		t.Fatal(err)
+	}
+
+	locker, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Close()
+	locker.SetMaxOpenConns(1)
+
+	ctx := context.Background()
+	conn, err := locker.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.ExecContext(ctx, "ROLLBACK")
+
+	if _, _, err := store.Reserve("locked", []string{"true"}); err == nil {
+		t.Fatal("Reserve succeeded while database was locked")
+	}
+	if _, err := store.Get("locked"); err != ErrNotFound {
+		t.Fatalf("Get err = %v, want ErrNotFound", err)
 	}
 }
 

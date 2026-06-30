@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -95,12 +96,16 @@ func TestRunReplaysSavedFailure(t *testing.T) {
 }
 
 func TestRunRejectsRunningKey(t *testing.T) {
-	storePath := filepath.Join(t.TempDir(), "once.db")
+	t.Setenv("ONCE_TEST_HELPER", "1")
+
+	dir := t.TempDir()
+	storePath := filepath.Join(dir, "once.db")
+	marker := filepath.Join(dir, "side-effect")
 	store, err := once.OpenSQLite(storePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := []string{shell(), shellFlag(), "echo no"}
+	cmd := helperCommand("append", marker, "ran\n")
 	if _, _, err := store.Reserve("demo", cmd); err != nil {
 		t.Fatal(err)
 	}
@@ -118,6 +123,115 @@ func TestRunRejectsRunningKey(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "already running") {
 		t.Fatalf("stderr = %q", errOut.String())
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("command ran for running key; marker stat err = %v", err)
+	}
+}
+
+func TestRunStoresStartError(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	missing := filepath.Join(t.TempDir(), "missing-command")
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "run", "--key", "demo", "--", missing}, &out, &errOut)
+	if code != 127 {
+		t.Fatalf("run code = %d stderr = %s", code, errOut.String())
+	}
+	if out.Len() != 0 {
+		t.Fatalf("stdout = %q", out.String())
+	}
+
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := store.Get("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != once.Failed {
+		t.Fatalf("state = %s, want %s", rec.State, once.Failed)
+	}
+	if rec.ExitCode != 127 {
+		t.Fatalf("exit code = %d, want 127", rec.ExitCode)
+	}
+	if rec.Error == "" {
+		t.Fatal("missing stored start error")
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"--store", storePath, "run", "--key", "demo", "--", missing}, &out, &errOut)
+	if code != 127 {
+		t.Fatalf("replay code = %d stderr = %s", code, errOut.String())
+	}
+}
+
+func TestRunStoresKilledChildAsFailure(t *testing.T) {
+	t.Setenv("ONCE_TEST_HELPER", "1")
+
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	cmd := helperCommand("kill")
+
+	var out, errOut bytes.Buffer
+	code := Run(append([]string{"--store", storePath, "run", "--key", "demo", "--"}, cmd...), &out, &errOut)
+	if code == 0 {
+		t.Fatal("killed child should fail")
+	}
+
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := store.Get("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != once.Failed {
+		t.Fatalf("state = %s, want %s", rec.State, once.Failed)
+	}
+	if rec.FinishedAt == nil {
+		t.Fatal("missing finished_at")
+	}
+
+	out.Reset()
+	errOut.Reset()
+	replayCode := Run(append([]string{"--store", storePath, "run", "--key", "demo", "--"}, cmd...), &out, &errOut)
+	if replayCode != code {
+		t.Fatalf("replay code = %d, want %d", replayCode, code)
+	}
+}
+
+func TestRunStoresAndReplaysLargeStdout(t *testing.T) {
+	t.Setenv("ONCE_TEST_HELPER", "1")
+
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	size := 1<<20 + 123
+	cmd := helperCommand("stdout", strconv.Itoa(size))
+
+	var out1, err1 bytes.Buffer
+	code := Run(append([]string{"--store", storePath, "run", "--key", "demo", "--"}, cmd...), &out1, &err1)
+	if code != 0 {
+		t.Fatalf("first run code = %d stderr = %s", code, err1.String())
+	}
+	if out1.Len() != size {
+		t.Fatalf("first stdout len = %d, want %d", out1.Len(), size)
+	}
+
+	var out2, err2 bytes.Buffer
+	code = Run(append([]string{"--store", storePath, "run", "--key", "demo", "--"}, cmd...), &out2, &err2)
+	if code != 0 {
+		t.Fatalf("second run code = %d stderr = %s", code, err2.String())
+	}
+	if !bytes.Equal(out1.Bytes(), out2.Bytes()) {
+		t.Fatal("replayed stdout differs from stored stdout")
 	}
 }
 
@@ -278,4 +392,72 @@ func failScript() string {
 		return "echo bad && exit /b 9"
 	}
 	return "echo bad; exit 9"
+}
+
+func helperCommand(args ...string) []string {
+	cmd := []string{os.Args[0], "-test.run=TestHelperProcess", "--"}
+	return append(cmd, args...)
+}
+
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv("ONCE_TEST_HELPER") != "1" {
+		return
+	}
+
+	args := os.Args
+	for len(args) > 0 && args[0] != "--" {
+		args = args[1:]
+	}
+	if len(args) < 2 {
+		os.Exit(2)
+	}
+	args = args[1:]
+
+	switch args[0] {
+	case "append":
+		if len(args) < 3 {
+			os.Exit(2)
+		}
+		file, err := os.OpenFile(args[1], os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			os.Exit(3)
+		}
+		if _, err := file.WriteString(args[2]); err != nil {
+			_ = file.Close()
+			os.Exit(3)
+		}
+		if err := file.Close(); err != nil {
+			os.Exit(3)
+		}
+		os.Exit(0)
+	case "kill":
+		proc, err := os.FindProcess(os.Getpid())
+		if err != nil {
+			os.Exit(3)
+		}
+		_ = proc.Kill()
+		os.Exit(3)
+	case "stdout":
+		if len(args) != 2 {
+			os.Exit(2)
+		}
+		size, err := strconv.Atoi(args[1])
+		if err != nil {
+			os.Exit(2)
+		}
+		chunk := strings.Repeat("x", 8192)
+		for size > 0 {
+			n := len(chunk)
+			if size < n {
+				n = size
+			}
+			if _, err := os.Stdout.WriteString(chunk[:n]); err != nil {
+				os.Exit(3)
+			}
+			size -= n
+		}
+		os.Exit(0)
+	default:
+		os.Exit(2)
+	}
 }
