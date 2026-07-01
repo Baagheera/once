@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -254,6 +253,7 @@ func (s *SQLiteStore) List(opts ListOptions) ([]Record, error) {
 	if opts.IncludeOutput {
 		outputColumns = "stdout, stderr"
 	}
+	updatedAtExpr := sqliteSortableTimeExpr("updated_at")
 	query := `
 SELECT key, attempt_hash, state, exit_code, ` + outputColumns + `, error, command, started_at, finished_at, updated_at
 FROM once_records
@@ -262,6 +262,11 @@ FROM once_records
 	if opts.State != "" {
 		query += "WHERE state = ?\n"
 		args = append(args, string(opts.State))
+	}
+	query += "ORDER BY " + updatedAtExpr + " DESC, key ASC\n"
+	if opts.Limit > 0 {
+		query += "LIMIT ?\n"
+		args = append(args, opts.Limit)
 	}
 
 	rows, err := s.db.Query(query, args...)
@@ -280,15 +285,6 @@ FROM once_records
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
-	}
-	sort.Slice(records, func(i, j int) bool {
-		if records[i].UpdatedAt.Equal(records[j].UpdatedAt) {
-			return records[i].Key < records[j].Key
-		}
-		return records[i].UpdatedAt.After(records[j].UpdatedAt)
-	})
-	if opts.Limit > 0 && len(records) > opts.Limit {
-		records = records[:opts.Limit]
 	}
 	return records, nil
 }
@@ -319,11 +315,13 @@ type pruneRunner interface {
 }
 
 func pruneCandidates(ctx context.Context, runner pruneRunner, opts PruneOptions) ([]Record, error) {
+	updatedAtExpr := sqliteSortableTimeExpr("updated_at")
 	rows, err := runner.QueryContext(ctx, `
 SELECT key, attempt_hash, state, exit_code, X'' AS stdout, X'' AS stderr, error, command, started_at, finished_at, updated_at
 FROM once_records
-WHERE state = ?
-`, string(opts.State))
+WHERE state = ? AND `+updatedAtExpr+` < ?
+ORDER BY `+updatedAtExpr+` ASC, key ASC
+`, string(opts.State), formatSortableTime(opts.Cutoff))
 	if err != nil {
 		return nil, err
 	}
@@ -335,9 +333,7 @@ WHERE state = ?
 			_ = rows.Close()
 			return nil, err
 		}
-		if rec.UpdatedAt.Before(opts.Cutoff) {
-			records = append(records, rec)
-		}
+		records = append(records, rec)
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
@@ -345,12 +341,6 @@ WHERE state = ?
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	sort.Slice(records, func(i, j int) bool {
-		if records[i].UpdatedAt.Equal(records[j].UpdatedAt) {
-			return records[i].Key < records[j].Key
-		}
-		return records[i].UpdatedAt.Before(records[j].UpdatedAt)
-	})
 	return records, nil
 }
 
@@ -492,6 +482,19 @@ func (s *SQLiteStore) AdminForget(key string, force bool) (bool, error) {
 
 func formatTime(t time.Time) string {
 	return t.UTC().Format(time.RFC3339Nano)
+}
+
+func formatSortableTime(t time.Time) string {
+	return t.UTC().Format("2006-01-02T15:04:05.000000000")
+}
+
+// Stored timestamps use RFC3339Nano, so fractional seconds are not fixed width.
+// Normalize before comparing in SQLite; raw lexical ordering puts ".1Z" after ".11Z".
+func sqliteSortableTimeExpr(column string) string {
+	return "substr(" + column + ", 1, 19) || '.' || " +
+		"CASE WHEN substr(" + column + ", 20, 1) = '.' " +
+		"THEN substr(substr(" + column + ", 21, instr(" + column + ", 'Z') - 21) || '000000000', 1, 9) " +
+		"ELSE '000000000' END"
 }
 
 func parseTime(s string) (time.Time, error) {
