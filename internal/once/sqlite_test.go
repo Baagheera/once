@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -399,12 +400,15 @@ func TestListOrdersByParsedUpdatedAt(t *testing.T) {
 	base := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
 	older := base.Add(100 * time.Millisecond)
 	newer := base.Add(110 * time.Millisecond)
+	newest := base.Add(120 * time.Millisecond)
 	for _, row := range []struct {
 		key string
 		at  time.Time
 	}{
 		{key: "older", at: older},
 		{key: "newer", at: newer},
+		{key: "same-b", at: newest},
+		{key: "same-a", at: newest},
 	} {
 		if _, err := store.db.Exec(`
 INSERT INTO once_records (key, attempt_hash, state, command, started_at, updated_at)
@@ -418,11 +422,13 @@ VALUES (?, ?, 'running', '[]', ?, ?)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(records) != 2 {
-		t.Fatalf("len(records) = %d, want 2", len(records))
+	if len(records) != 4 {
+		t.Fatalf("len(records) = %d, want 4", len(records))
 	}
-	if records[0].Key != "newer" || records[1].Key != "older" {
-		t.Fatalf("order = %s, %s; want newer, older", records[0].Key, records[1].Key)
+	got := recordKeys(records)
+	want := []string{"same-a", "same-b", "newer", "older"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("order = %v, want %v", got, want)
 	}
 }
 
@@ -488,6 +494,43 @@ VALUES (?, ?, ?, 0, '[]', ?, ?, ?)
 		if _, err := store.Get(key); err != nil {
 			t.Fatalf("%s err = %v, want record to remain", key, err)
 		}
+	}
+}
+
+func TestPruneOrdersCandidatesByParsedUpdatedAt(t *testing.T) {
+	store, err := OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	base := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	cutoff := base.Add(200 * time.Millisecond)
+	for _, row := range []struct {
+		key string
+		at  time.Time
+	}{
+		{key: "old-b", at: base.Add(100 * time.Millisecond)},
+		{key: "old-a", at: base.Add(100 * time.Millisecond)},
+		{key: "older", at: base.Add(90 * time.Millisecond)},
+		{key: "recent", at: base.Add(210 * time.Millisecond)},
+	} {
+		if _, err := store.db.Exec(`
+INSERT INTO once_records (key, attempt_hash, state, exit_code, command, started_at, finished_at, updated_at)
+VALUES (?, ?, 'succeeded', 0, '[]', ?, ?, ?)
+`, row.key, row.key+"-attempt", formatTime(row.at), formatTime(row.at), formatTime(row.at)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := store.Prune(PruneOptions{State: Succeeded, Cutoff: cutoff})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := recordKeys(result.Records)
+	want := []string{"older", "old-a", "old-b"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("prune order = %v, want %v", got, want)
 	}
 }
 
@@ -611,4 +654,12 @@ func TestOpenSQLiteRejectsSymlinkSidecarsBeforeOpen(t *testing.T) {
 			}
 		})
 	}
+}
+
+func recordKeys(records []Record) []string {
+	keys := make([]string, len(records))
+	for i, rec := range records {
+		keys[i] = rec.Key
+	}
+	return keys
 }
