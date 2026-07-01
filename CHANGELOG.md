@@ -4,12 +4,21 @@ User-facing changes are recorded here as releases are prepared.
 
 ## Unreleased
 
+No unreleased changes.
+
+## v0.3.0 - 2026-07-01
+
 ### Added
 
 - CLI `run --timeout DURATION` option for timing out a command after a local
   runtime limit and replaying the stored timeout result.
 - CLI `run --max-output-bytes N` option for bounding stored command output and
   replaying a stored output-limit failure.
+
+### Changed
+
+- CLI `list` and `prune` now do more filtering, ordering, and limit work in
+  SQLite while preserving the existing record ordering.
 
 ## v0.2.2 - 2026-07-01
 
