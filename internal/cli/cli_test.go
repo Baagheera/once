@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"os"
@@ -234,6 +235,272 @@ func TestRunStoresAndReplaysLargeStdout(t *testing.T) {
 	}
 	if !bytes.Equal(out1.Bytes(), out2.Bytes()) {
 		t.Fatal("replayed stdout differs from stored stdout")
+	}
+}
+
+func TestDoctorReportsHealthyStore(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "doctor"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("doctor code = %d stdout = %s stderr = %s", code, out.String(), errOut.String())
+	}
+	output := out.String()
+	for _, want := range []string{"store path: ok", "sqlite open: ok", "sqlite schema: ok", "doctor: ok"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("doctor output missing %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestDoctorDoesNotCreateMissingStore(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "missing")
+	storePath := filepath.Join(dir, "once.db")
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "doctor"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("doctor code = %d stdout = %s stderr = %s", code, out.String(), errOut.String())
+	}
+	output := out.String()
+	for _, want := range []string{"store parent: warn", "store file: warn", "sqlite open: skip", "doctor: ok"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("doctor output missing %q:\n%s", want, output)
+		}
+	}
+	if _, err := os.Stat(storePath); !os.IsNotExist(err) {
+		t.Fatalf("doctor created store or returned unexpected stat error: %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("doctor created parent dir or returned unexpected stat error: %v", err)
+	}
+}
+
+func TestDoctorRejectsSQLiteDSNPath(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", "file:once.db?mode=ro", "doctor"}, &out, &errOut)
+	if code == 0 {
+		t.Fatalf("doctor should reject SQLite DSN paths:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "store path: fail") {
+		t.Fatalf("stdout = %q", out.String())
+	}
+	if !strings.Contains(out.String(), "local filesystem path") {
+		t.Fatalf("stdout = %q", out.String())
+	}
+}
+
+func TestDoctorDoesNotPrintToken(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	token := strings.Repeat("a", minAuthTokenLength)
+	if err := os.WriteFile(storePath+".token", []byte(token+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := once.RestrictLocalFile(storePath + ".token"); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "doctor"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("doctor code = %d stdout = %s stderr = %s", code, out.String(), errOut.String())
+	}
+	combined := out.String() + errOut.String()
+	if strings.Contains(combined, token) {
+		t.Fatalf("doctor leaked token material:\n%s", combined)
+	}
+	if !strings.Contains(out.String(), "token file: ok") {
+		t.Fatalf("stdout = %q", out.String())
+	}
+}
+
+func TestDoctorRejectsBadSQLiteSidecar(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, sidecar := range []string{storePath + "-wal", storePath + "-shm"} {
+		if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(storePath+"-wal", 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "doctor"}, &out, &errOut)
+	if code == 0 {
+		t.Fatalf("doctor should fail for non-regular sidecar:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "sqlite wal: fail") {
+		t.Fatalf("stdout = %q", out.String())
+	}
+}
+
+func TestDoctorRejectsOrphanSQLiteSidecar(t *testing.T) {
+	dir := t.TempDir()
+	storePath := filepath.Join(dir, "once.db")
+	walPath := storePath + "-wal"
+	if err := os.WriteFile(walPath, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := once.RestrictLocalFile(walPath); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "doctor"}, &out, &errOut)
+	if code == 0 {
+		t.Fatalf("doctor should fail for orphan sidecar:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "sqlite wal: fail") {
+		t.Fatalf("stdout = %q", out.String())
+	}
+	if !strings.Contains(out.String(), "store file is missing") {
+		t.Fatalf("stdout = %q", out.String())
+	}
+}
+
+func TestDoctorReportsMissingSchema(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	db, err := sql.Open("sqlite", storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := once.RestrictLocalFile(storePath); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "doctor"}, &out, &errOut)
+	if code == 0 {
+		t.Fatalf("doctor should fail for missing schema:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "sqlite schema: fail") {
+		t.Fatalf("stdout = %q", out.String())
+	}
+	if !strings.Contains(out.String(), "once_records table is missing") {
+		t.Fatalf("stdout = %q", out.String())
+	}
+}
+
+func TestDoctorReportsSchemaWithoutPrimaryKey(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	db := openDoctorTestDB(t, storePath)
+	execDoctorTestSQL(t, db, `
+CREATE TABLE once_records (
+	key TEXT,
+	attempt_hash TEXT NOT NULL DEFAULT '',
+	state TEXT NOT NULL,
+	exit_code INTEGER NOT NULL DEFAULT 0,
+	stdout BLOB NOT NULL DEFAULT X'',
+	stderr BLOB NOT NULL DEFAULT X'',
+	error TEXT NOT NULL DEFAULT '',
+	command TEXT NOT NULL DEFAULT '[]',
+	started_at TEXT NOT NULL,
+	finished_at TEXT,
+	updated_at TEXT NOT NULL
+);
+CREATE INDEX once_records_state_idx ON once_records(state);
+`)
+	closeDoctorTestDB(t, db, storePath)
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "doctor"}, &out, &errOut)
+	if code == 0 {
+		t.Fatalf("doctor should fail for missing primary key:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "key column is not the primary key") {
+		t.Fatalf("stdout = %q", out.String())
+	}
+}
+
+func TestDoctorReportsMissingSchemaColumn(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	db := openDoctorTestDB(t, storePath)
+	execDoctorTestSQL(t, db, `
+CREATE TABLE once_records (
+	key TEXT PRIMARY KEY,
+	state TEXT NOT NULL,
+	exit_code INTEGER NOT NULL DEFAULT 0,
+	stdout BLOB NOT NULL DEFAULT X'',
+	stderr BLOB NOT NULL DEFAULT X'',
+	error TEXT NOT NULL DEFAULT '',
+	command TEXT NOT NULL DEFAULT '[]',
+	started_at TEXT NOT NULL,
+	finished_at TEXT,
+	updated_at TEXT NOT NULL
+);
+CREATE INDEX once_records_state_idx ON once_records(state);
+`)
+	closeDoctorTestDB(t, db, storePath)
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "doctor"}, &out, &errOut)
+	if code == 0 {
+		t.Fatalf("doctor should fail for missing column:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "once_records missing columns: attempt_hash") {
+		t.Fatalf("stdout = %q", out.String())
+	}
+}
+
+func TestDoctorReportsMissingSchemaDefault(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	db := openDoctorTestDB(t, storePath)
+	execDoctorTestSQL(t, db, `
+CREATE TABLE once_records (
+	key TEXT PRIMARY KEY,
+	attempt_hash TEXT NOT NULL DEFAULT '',
+	state TEXT NOT NULL,
+	exit_code INTEGER NOT NULL,
+	stdout BLOB NOT NULL DEFAULT X'',
+	stderr BLOB NOT NULL DEFAULT X'',
+	error TEXT NOT NULL DEFAULT '',
+	command TEXT NOT NULL DEFAULT '[]',
+	started_at TEXT NOT NULL,
+	finished_at TEXT,
+	updated_at TEXT NOT NULL
+);
+CREATE INDEX once_records_state_idx ON once_records(state);
+`)
+	closeDoctorTestDB(t, db, storePath)
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "doctor"}, &out, &errOut)
+	if code == 0 {
+		t.Fatalf("doctor should fail for missing default:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "exit_code column default is <none>, want 0") {
+		t.Fatalf("stdout = %q", out.String())
 	}
 }
 
@@ -601,6 +868,39 @@ func TestResolveAuthTokenRejectsSymlinkAncestor(t *testing.T) {
 	tokenFile := filepath.Join(link, "sub", "once.token")
 	if _, _, err := resolveAuthToken("", tokenFile, false, filepath.Join(dir, "once.db")); err == nil {
 		t.Fatal("expected symlink ancestor to be rejected")
+	}
+}
+
+func openDoctorTestDB(t *testing.T, storePath string) *sql.DB {
+	t.Helper()
+
+	db, err := sql.Open("sqlite", storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	return db
+}
+
+func execDoctorTestSQL(t *testing.T, db *sql.DB, query string) {
+	t.Helper()
+
+	if _, err := db.Exec(query); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func closeDoctorTestDB(t *testing.T, db *sql.DB, storePath string) {
+	t.Helper()
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := once.RestrictLocalFile(storePath); err != nil {
+		t.Fatal(err)
 	}
 }
 

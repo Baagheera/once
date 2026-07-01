@@ -53,6 +53,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return statusCommand(args[1:], storePath, stdout, stderr)
 	case "get":
 		return getCommand(args[1:], storePath, stdout, stderr)
+	case "doctor":
+		return doctorCommand(args[1:], storePath, stdout, stderr)
 	case "list":
 		return listCommand(args[1:], storePath, stdout, stderr)
 	case "export":
@@ -690,6 +692,7 @@ func usage(w io.Writer) {
 		"  once [--store PATH] serve [--listen ADDR] [--token TOKEN | --token-file PATH]",
 		"  once [--store PATH] status KEY",
 		"  once [--store PATH] get KEY",
+		"  once [--store PATH] doctor",
 		"  once [--store PATH] list [--state STATE] [--limit N]",
 		"  once [--store PATH] export [--state STATE] [--limit N] [--include-output]",
 		"  once [--store PATH] prune --state STATE --older-than DURATION [--force]",
