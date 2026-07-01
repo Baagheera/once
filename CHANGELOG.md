@@ -4,7 +4,10 @@ User-facing changes are recorded here as releases are prepared.
 
 ## Unreleased
 
-No unreleased changes.
+### Added
+
+- CLI `run --timeout DURATION` option for timing out a command after a local
+  runtime limit and replaying the stored timeout result.
 
 ## v0.2.2 - 2026-07-01
 
