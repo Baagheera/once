@@ -79,8 +79,9 @@ saved result.
 
 `failed`
 
-The command exited with a non-zero code, or could not be started. Future runs
-with the same key replay the saved failure.
+The command exited with a non-zero code, could not be started, or hit a local
+execution limit such as timeout or maximum stored output. Future runs with the
+same key replay the saved failure.
 
 ## Important limitation
 
@@ -120,9 +121,10 @@ the result later. Treat SQLite sidecar files such as `once.db-wal` and
 `once run` is intended for finite, non-interactive commands.
 
 Today it buffers stdout and stderr in memory before storing them, so output is
-not streamed live and very large output is not a good fit yet. It also does not
-pass stdin to the child process. Use `once run --timeout DURATION` when a
-command should be stopped after a local runtime limit.
+not streamed live. Use `once run --max-output-bytes N` when a command might
+write too much output to keep. It also does not pass stdin to the child process.
+Use `once run --timeout DURATION` when a command should be stopped after a
+local runtime limit.
 
 The command line is stored to catch accidental key reuse, but once cannot infer
 changes in environment variables, input files, remote state, or other context
@@ -131,7 +133,7 @@ outside the command arguments. Put that identity in the key today.
 ## Commands
 
 ```sh
-once run --key KEY [--timeout DURATION] -- COMMAND [ARG...]
+once run --key KEY [--timeout DURATION] [--max-output-bytes N] -- COMMAND [ARG...]
 once serve [--listen ADDR] [--token-file PATH]
 once status KEY
 once get KEY
@@ -172,6 +174,13 @@ exists for the key and command, once replays that stored result; changing
 `--timeout` later does not rerun it. Timeout is not a sandbox or transaction
 boundary. Commands that spawn or detach child processes can still leave work
 behind after the parent command is stopped.
+
+`run --max-output-bytes` limits the total stored stdout and stderr bytes. Output
+past the limit is discarded while the command continues. If the limit is
+exceeded, once stores a `failed` result with exit code `125` and replays the
+truncated output and stored error on later runs. Changing `--max-output-bytes`
+later does not rerun an existing record. Use `--max-output-bytes 0` to store no
+output; omit the flag for no output cap.
 
 For stuck `running` records and terminal cleanup, see the
 [`repair cookbook`](docs/repair-cookbook.md).
