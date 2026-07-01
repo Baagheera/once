@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
@@ -78,6 +79,7 @@ func runCommand(args []string, storePath string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	key := fs.String("key", "", "idempotency key")
 	timeout := fs.Duration("timeout", 0, "maximum command runtime")
+	maxOutputBytes := fs.Int64("max-output-bytes", 0, "maximum stored stdout and stderr bytes")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -86,6 +88,16 @@ func runCommand(args []string, storePath string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "once: --timeout must be non-negative")
 		return 2
 	}
+	if *maxOutputBytes < 0 {
+		fmt.Fprintln(stderr, "once: --max-output-bytes must be non-negative")
+		return 2
+	}
+	limitOutput := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "max-output-bytes" {
+			limitOutput = true
+		}
+	})
 	if *key == "" {
 		fmt.Fprintln(stderr, "once: run needs --key")
 		return 2
@@ -116,7 +128,7 @@ func runCommand(args []string, storePath string, stdout, stderr io.Writer) int {
 		return replayRecord(rec, stdout, stderr)
 	}
 
-	exitCode, out, errOut, runErr := execute(command, *timeout)
+	exitCode, out, errOut, runErr := execute(command, *timeout, *maxOutputBytes, limitOutput)
 	state := once.Succeeded
 	if exitCode != 0 || runErr != "" {
 		state = once.Failed
@@ -559,30 +571,96 @@ func formatCommand(command []string) string {
 	return strings.Join(quoted, " ")
 }
 
-func execute(command []string, timeout time.Duration) (int, []byte, []byte, string) {
+func execute(command []string, timeout time.Duration, maxOutputBytes int64, limitOutput bool) (int, []byte, []byte, string) {
 	cmd := exec.Command(command[0], command[1:]...)
 	if timeout > 0 {
 		prepareTimeoutCommand(cmd)
 	}
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	var outputLimit *limitedOutput
+	if limitOutput {
+		outputLimit = &limitedOutput{max: maxOutputBytes}
+		cmd.Stdout = outputLimit.writer(&stdout)
+		cmd.Stderr = outputLimit.writer(&stderr)
+	} else {
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+	}
 
 	err, timedOut := runProcess(cmd, timeout)
+	exitCode := 0
+	runErr := ""
 	if err == nil {
-		return 0, stdout.Bytes(), stderr.Bytes(), ""
-	}
-	if timedOut {
-		return 124, stdout.Bytes(), stderr.Bytes(), fmt.Sprintf("command timed out after %s", timeout)
+		exitCode = 0
+	} else if timedOut {
+		exitCode = 124
+		runErr = fmt.Sprintf("command timed out after %s", timeout)
+	} else {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = 127
+			runErr = err.Error()
+		}
 	}
 
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		return exitErr.ExitCode(), stdout.Bytes(), stderr.Bytes(), ""
+	if outputLimit != nil && outputLimit.exceededLimit() {
+		limitErr := fmt.Sprintf("output exceeded --max-output-bytes=%d", maxOutputBytes)
+		if runErr == "" {
+			runErr = limitErr
+		} else {
+			runErr += "; " + limitErr
+		}
+		exitCode = 125
 	}
 
-	return 127, stdout.Bytes(), stderr.Bytes(), err.Error()
+	return exitCode, stdout.Bytes(), stderr.Bytes(), runErr
+}
+
+type limitedOutput struct {
+	mu       sync.Mutex
+	max      int64
+	stored   int64
+	exceeded bool
+}
+
+func (l *limitedOutput) writer(dst *bytes.Buffer) io.Writer {
+	return limitedOutputWriter{limit: l, dst: dst}
+}
+
+func (l *limitedOutput) exceededLimit() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.exceeded
+}
+
+type limitedOutputWriter struct {
+	limit *limitedOutput
+	dst   *bytes.Buffer
+}
+
+func (w limitedOutputWriter) Write(p []byte) (int, error) {
+	w.limit.mu.Lock()
+	defer w.limit.mu.Unlock()
+
+	remaining := w.limit.max - w.limit.stored
+	if remaining > 0 {
+		n := len(p)
+		if int64(n) > remaining {
+			n = int(remaining)
+		}
+		if _, err := w.dst.Write(p[:n]); err != nil {
+			return 0, err
+		}
+		w.limit.stored += int64(n)
+		if n == len(p) {
+			return len(p), nil
+		}
+	}
+	w.limit.exceeded = true
+	return len(p), nil
 }
 
 type timeoutProcess struct {
@@ -736,7 +814,7 @@ func loadOrCreateTokenFile(path string) (string, error) {
 func usage(w io.Writer) {
 	lines := []string{
 		"usage:",
-		"  once [--store PATH] run --key KEY [--timeout DURATION] -- COMMAND [ARG...]",
+		"  once [--store PATH] run --key KEY [--timeout DURATION] [--max-output-bytes N] -- COMMAND [ARG...]",
 		"  once [--store PATH] serve [--listen ADDR] [--token TOKEN | --token-file PATH]",
 		"  once [--store PATH] status KEY",
 		"  once [--store PATH] get KEY",

@@ -344,6 +344,194 @@ func TestRunStoresAndReplaysLargeStdout(t *testing.T) {
 	}
 }
 
+func TestRunCompletesWithinMaxOutputBytes(t *testing.T) {
+	t.Setenv("ONCE_TEST_HELPER", "1")
+
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	cmd := helperCommand("stdout", "32")
+
+	var out, errOut bytes.Buffer
+	code := Run(append([]string{"--store", storePath, "run", "--key", "demo", "--max-output-bytes", "64", "--"}, cmd...), &out, &errOut)
+	if code != 0 {
+		t.Fatalf("run code = %d stderr = %s", code, errOut.String())
+	}
+	if out.Len() != 32 {
+		t.Fatalf("stdout len = %d, want 32", out.Len())
+	}
+
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := store.Get("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != once.Succeeded {
+		t.Fatalf("state = %s, want %s", rec.State, once.Succeeded)
+	}
+}
+
+func TestRunLimitsStoredOutput(t *testing.T) {
+	t.Setenv("ONCE_TEST_HELPER", "1")
+
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	cmd := helperCommand("stdout", "4096")
+
+	var out1, err1 bytes.Buffer
+	code := Run(append([]string{"--store", storePath, "run", "--key", "demo", "--max-output-bytes", "128", "--"}, cmd...), &out1, &err1)
+	if code != 125 {
+		t.Fatalf("run code = %d stderr = %s", code, err1.String())
+	}
+	if out1.Len() != 128 {
+		t.Fatalf("stdout len = %d, want 128", out1.Len())
+	}
+	if !strings.Contains(err1.String(), "max-output-bytes") {
+		t.Fatalf("stderr = %q", err1.String())
+	}
+
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := store.Get("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != once.Failed {
+		t.Fatalf("state = %s, want %s", rec.State, once.Failed)
+	}
+	if rec.ExitCode != 125 {
+		t.Fatalf("exit code = %d, want 125", rec.ExitCode)
+	}
+	if len(rec.Stdout) != 128 {
+		t.Fatalf("stored stdout len = %d, want 128", len(rec.Stdout))
+	}
+	if !strings.Contains(rec.Error, "max-output-bytes") {
+		t.Fatalf("stored error = %q", rec.Error)
+	}
+
+	var out2, err2 bytes.Buffer
+	replayCode := Run(append([]string{"--store", storePath, "run", "--key", "demo", "--max-output-bytes", "4096", "--"}, cmd...), &out2, &err2)
+	if replayCode != 125 {
+		t.Fatalf("replay code = %d stderr = %s", replayCode, err2.String())
+	}
+	if !bytes.Equal(out1.Bytes(), out2.Bytes()) {
+		t.Fatal("replayed stdout differs from stored stdout")
+	}
+	if !strings.Contains(err2.String(), "max-output-bytes") {
+		t.Fatalf("replay stderr = %q", err2.String())
+	}
+}
+
+func TestRunMaxOutputBytesZeroStoresNoOutput(t *testing.T) {
+	t.Setenv("ONCE_TEST_HELPER", "1")
+
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	cmd := helperCommand("stdout", "32")
+
+	var out1, err1 bytes.Buffer
+	code := Run(append([]string{"--store", storePath, "run", "--key", "demo", "--max-output-bytes", "0", "--"}, cmd...), &out1, &err1)
+	if code != 125 {
+		t.Fatalf("run code = %d stderr = %s", code, err1.String())
+	}
+	if out1.Len() != 0 {
+		t.Fatalf("stdout len = %d, want 0", out1.Len())
+	}
+	if !strings.Contains(err1.String(), "max-output-bytes") {
+		t.Fatalf("stderr = %q", err1.String())
+	}
+
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := store.Get("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != once.Failed {
+		t.Fatalf("state = %s, want %s", rec.State, once.Failed)
+	}
+	if rec.ExitCode != 125 {
+		t.Fatalf("exit code = %d, want 125", rec.ExitCode)
+	}
+	if len(rec.Stdout) != 0 {
+		t.Fatalf("stored stdout len = %d, want 0", len(rec.Stdout))
+	}
+	if !strings.Contains(rec.Error, "max-output-bytes") {
+		t.Fatalf("stored error = %q", rec.Error)
+	}
+
+	var out2, err2 bytes.Buffer
+	replayCode := Run(append([]string{"--store", storePath, "run", "--key", "demo", "--"}, cmd...), &out2, &err2)
+	if replayCode != 125 {
+		t.Fatalf("replay code = %d stderr = %s", replayCode, err2.String())
+	}
+	if out2.Len() != 0 {
+		t.Fatalf("replay stdout len = %d, want 0", out2.Len())
+	}
+	if !strings.Contains(err2.String(), "max-output-bytes") {
+		t.Fatalf("replay stderr = %q", err2.String())
+	}
+}
+
+func TestRunMaxOutputBytesIsSharedAcrossStreams(t *testing.T) {
+	t.Setenv("ONCE_TEST_HELPER", "1")
+
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	cmd := helperCommand("stdout-stderr", "80", "80")
+
+	var out, errOut bytes.Buffer
+	code := Run(append([]string{"--store", storePath, "run", "--key", "demo", "--max-output-bytes", "100", "--"}, cmd...), &out, &errOut)
+	if code != 125 {
+		t.Fatalf("run code = %d stderr = %s", code, errOut.String())
+	}
+
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := store.Get("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(rec.Stdout) + len(rec.Stderr); got != 100 {
+		t.Fatalf("stored output len = %d, want 100", got)
+	}
+	if rec.ExitCode != 125 {
+		t.Fatalf("exit code = %d, want 125", rec.ExitCode)
+	}
+}
+
+func TestRunRejectsNegativeMaxOutputBytes(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "run", "--key", "demo", "--max-output-bytes", "-1", "--", "ignored"}, &out, &errOut)
+	if code != 2 {
+		t.Fatalf("run code = %d stderr = %s", code, errOut.String())
+	}
+	if out.Len() != 0 {
+		t.Fatalf("stdout = %q", out.String())
+	}
+	if !strings.Contains(errOut.String(), "non-negative") {
+		t.Fatalf("stderr = %q", errOut.String())
+	}
+}
+
 func TestDoctorReportsHealthyStore(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "once.db")
 	store, err := once.OpenSQLite(storePath)
@@ -1095,6 +1283,25 @@ func TestHelperProcess(t *testing.T) {
 				os.Exit(3)
 			}
 			size -= n
+		}
+		os.Exit(0)
+	case "stdout-stderr":
+		if len(args) != 3 {
+			os.Exit(2)
+		}
+		stdoutSize, err := strconv.Atoi(args[1])
+		if err != nil {
+			os.Exit(2)
+		}
+		stderrSize, err := strconv.Atoi(args[2])
+		if err != nil {
+			os.Exit(2)
+		}
+		if _, err := os.Stdout.WriteString(strings.Repeat("o", stdoutSize)); err != nil {
+			os.Exit(3)
+		}
+		if _, err := os.Stderr.WriteString(strings.Repeat("e", stderrSize)); err != nil {
+			os.Exit(3)
 		}
 		os.Exit(0)
 	case "sleep":
