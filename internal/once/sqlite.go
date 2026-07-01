@@ -24,11 +24,11 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 	if path == "" {
 		return nil, fmt.Errorf("empty sqlite path")
 	}
-	if err := rejectSQLiteDSNPath(path); err != nil {
+	if err := ValidateSQLitePath(path); err != nil {
 		return nil, err
 	}
 	path = filepath.Clean(path)
-	if err := rejectSQLiteDSNPath(path); err != nil {
+	if err := ValidateSQLitePath(path); err != nil {
 		return nil, err
 	}
 	if err := RejectSymlinkPath(path); err != nil {
@@ -72,7 +72,9 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 	return s, nil
 }
 
-func rejectSQLiteDSNPath(path string) error {
+// ValidateSQLitePath rejects SQLite DSN forms. once stores must be local
+// filesystem paths so SQLite options cannot bypass local file checks.
+func ValidateSQLitePath(path string) error {
 	lower := strings.ToLower(path)
 	if lower == ":memory:" || strings.HasPrefix(lower, "file:") || strings.Contains(path, "?") {
 		return fmt.Errorf("sqlite path must be a local filesystem path")

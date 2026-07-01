@@ -134,6 +134,7 @@ once run --key KEY -- COMMAND [ARG...]
 once serve [--listen ADDR] [--token-file PATH]
 once status KEY
 once get KEY
+once doctor
 once list [--state STATE] [--limit N]
 once export [--state STATE] [--limit N] [--include-output]
 once prune --state STATE --older-than DURATION [--force]
@@ -145,6 +146,11 @@ Global flags:
 ```sh
 --store PATH    SQLite database path. Default: once.db
 ```
+
+`doctor` checks the local store path, file permissions, SQLite sidecar files,
+schema, and default token-file state. It reports problems and skipped checks;
+it does not repair the store, print token contents, or print stored command
+output.
 
 `list` prints a local summary of records for operators. `export` writes JSONL,
 one record per line, for scripts and audit trails. It omits stored stdout and

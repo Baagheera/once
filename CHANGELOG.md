@@ -4,7 +4,11 @@ User-facing changes are recorded here as releases are prepared.
 
 ## Unreleased
 
-No unreleased changes.
+### Added
+
+- CLI `doctor` command for local store, permission, sidecar, schema, and
+  token-file diagnostics without repairing the store or printing sensitive
+  contents.
 
 ## v0.2.1 - 2026-07-01
 
