@@ -77,10 +77,15 @@ func runCommand(args []string, storePath string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	key := fs.String("key", "", "idempotency key")
+	timeout := fs.Duration("timeout", 0, "maximum command runtime")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	command := fs.Args()
+	if *timeout < 0 {
+		fmt.Fprintln(stderr, "once: --timeout must be non-negative")
+		return 2
+	}
 	if *key == "" {
 		fmt.Fprintln(stderr, "once: run needs --key")
 		return 2
@@ -111,7 +116,7 @@ func runCommand(args []string, storePath string, stdout, stderr io.Writer) int {
 		return replayRecord(rec, stdout, stderr)
 	}
 
-	exitCode, out, errOut, runErr := execute(command)
+	exitCode, out, errOut, runErr := execute(command, *timeout)
 	state := once.Succeeded
 	if exitCode != 0 || runErr != "" {
 		state = once.Failed
@@ -554,16 +559,22 @@ func formatCommand(command []string) string {
 	return strings.Join(quoted, " ")
 }
 
-func execute(command []string) (int, []byte, []byte, string) {
+func execute(command []string, timeout time.Duration) (int, []byte, []byte, string) {
 	cmd := exec.Command(command[0], command[1:]...)
+	if timeout > 0 {
+		prepareTimeoutCommand(cmd)
+	}
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
+	err, timedOut := runProcess(cmd, timeout)
 	if err == nil {
 		return 0, stdout.Bytes(), stderr.Bytes(), ""
+	}
+	if timedOut {
+		return 124, stdout.Bytes(), stderr.Bytes(), fmt.Sprintf("command timed out after %s", timeout)
 	}
 
 	var exitErr *exec.ExitError
@@ -572,6 +583,43 @@ func execute(command []string) (int, []byte, []byte, string) {
 	}
 
 	return 127, stdout.Bytes(), stderr.Bytes(), err.Error()
+}
+
+type timeoutProcess struct {
+	kill    func() error
+	cleanup func()
+}
+
+func runProcess(cmd *exec.Cmd, timeout time.Duration) (error, bool) {
+	if timeout <= 0 {
+		return cmd.Run(), false
+	}
+	if err := cmd.Start(); err != nil {
+		return err, false
+	}
+	timeoutProc, err := attachTimeoutCommand(cmd)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return err, false
+	}
+	defer timeoutProc.cleanup()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case err := <-done:
+		return err, false
+	case <-timer.C:
+		_ = timeoutProc.kill()
+		return <-done, true
+	}
 }
 
 func replayRecord(rec once.Record, stdout, stderr io.Writer) int {
@@ -688,7 +736,7 @@ func loadOrCreateTokenFile(path string) (string, error) {
 func usage(w io.Writer) {
 	lines := []string{
 		"usage:",
-		"  once [--store PATH] run --key KEY -- COMMAND [ARG...]",
+		"  once [--store PATH] run --key KEY [--timeout DURATION] -- COMMAND [ARG...]",
 		"  once [--store PATH] serve [--listen ADDR] [--token TOKEN | --token-file PATH]",
 		"  once [--store PATH] status KEY",
 		"  once [--store PATH] get KEY",

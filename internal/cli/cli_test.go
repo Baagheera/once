@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	once "github.com/Baagheera/once/internal/once"
 )
@@ -209,6 +210,111 @@ func TestRunStoresKilledChildAsFailure(t *testing.T) {
 	replayCode := Run(append([]string{"--store", storePath, "run", "--key", "demo", "--"}, cmd...), &out, &errOut)
 	if replayCode != code {
 		t.Fatalf("replay code = %d, want %d", replayCode, code)
+	}
+}
+
+func TestRunCompletesBeforeTimeout(t *testing.T) {
+	t.Setenv("ONCE_TEST_HELPER", "1")
+
+	dir := t.TempDir()
+	storePath := filepath.Join(dir, "once.db")
+	marker := filepath.Join(dir, "side-effect")
+	cmd := helperCommand("append", marker, "ran\n")
+
+	var out, errOut bytes.Buffer
+	code := Run(append([]string{"--store", storePath, "run", "--key", "demo", "--timeout", "1s", "--"}, cmd...), &out, &errOut)
+	if code != 0 {
+		t.Fatalf("run code = %d stderr = %s", code, errOut.String())
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "ran\n" {
+		t.Fatalf("marker = %q", data)
+	}
+
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := store.Get("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != once.Succeeded {
+		t.Fatalf("state = %s, want %s", rec.State, once.Succeeded)
+	}
+}
+
+func TestRunTimesOutAndReplaysFailure(t *testing.T) {
+	t.Setenv("ONCE_TEST_HELPER", "1")
+
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	cmd := helperCommand("sleep", "200ms")
+
+	var out1, err1 bytes.Buffer
+	code := Run(append([]string{"--store", storePath, "run", "--key", "demo", "--timeout", "20ms", "--"}, cmd...), &out1, &err1)
+	if code != 124 {
+		t.Fatalf("run code = %d stderr = %s", code, err1.String())
+	}
+	if out1.Len() != 0 {
+		t.Fatalf("stdout = %q", out1.String())
+	}
+	if !strings.Contains(err1.String(), "timed out") {
+		t.Fatalf("stderr = %q", err1.String())
+	}
+
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := store.Get("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != once.Failed {
+		t.Fatalf("state = %s, want %s", rec.State, once.Failed)
+	}
+	if rec.ExitCode != 124 {
+		t.Fatalf("exit code = %d, want 124", rec.ExitCode)
+	}
+	if !strings.Contains(rec.Error, "timed out") {
+		t.Fatalf("stored error = %q", rec.Error)
+	}
+
+	var out2, err2 bytes.Buffer
+	replayCode := Run(append([]string{"--store", storePath, "run", "--key", "demo", "--timeout", "1s", "--"}, cmd...), &out2, &err2)
+	if replayCode != 124 {
+		t.Fatalf("replay code = %d stderr = %s", replayCode, err2.String())
+	}
+	if out2.Len() != 0 {
+		t.Fatalf("replay stdout = %q", out2.String())
+	}
+	if !strings.Contains(err2.String(), "timed out") {
+		t.Fatalf("replay stderr = %q", err2.String())
+	}
+}
+
+func TestRunRejectsNegativeTimeout(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "run", "--key", "demo", "--timeout", "-1s", "--", "ignored"}, &out, &errOut)
+	if code != 2 {
+		t.Fatalf("run code = %d stderr = %s", code, errOut.String())
+	}
+	if out.Len() != 0 {
+		t.Fatalf("stdout = %q", out.String())
+	}
+	if !strings.Contains(errOut.String(), "non-negative") {
+		t.Fatalf("stderr = %q", errOut.String())
 	}
 }
 
@@ -990,6 +1096,16 @@ func TestHelperProcess(t *testing.T) {
 			}
 			size -= n
 		}
+		os.Exit(0)
+	case "sleep":
+		if len(args) != 2 {
+			os.Exit(2)
+		}
+		duration, err := time.ParseDuration(args[1])
+		if err != nil {
+			os.Exit(2)
+		}
+		time.Sleep(duration)
 		os.Exit(0)
 	default:
 		os.Exit(2)

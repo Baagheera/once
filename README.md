@@ -121,7 +121,8 @@ the result later. Treat SQLite sidecar files such as `once.db-wal` and
 
 Today it buffers stdout and stderr in memory before storing them, so output is
 not streamed live and very large output is not a good fit yet. It also does not
-pass stdin to the child process.
+pass stdin to the child process. Use `once run --timeout DURATION` when a
+command should be stopped after a local runtime limit.
 
 The command line is stored to catch accidental key reuse, but once cannot infer
 changes in environment variables, input files, remote state, or other context
@@ -130,7 +131,7 @@ outside the command arguments. Put that identity in the key today.
 ## Commands
 
 ```sh
-once run --key KEY -- COMMAND [ARG...]
+once run --key KEY [--timeout DURATION] -- COMMAND [ARG...]
 once serve [--listen ADDR] [--token-file PATH]
 once status KEY
 once get KEY
@@ -161,6 +162,16 @@ handle.
 store. It requires `--state succeeded` or `--state failed`; durations can use
 Go syntax such as `24h` or day syntax such as `30d`. Without `--force` it only
 prints the records it would delete.
+
+`run --timeout` times out the started command after the given duration. A
+timed-out command is stored as `failed` with exit code `124`, then replayed like
+any other stored result. Durations use Go syntax such as `30s`, `5m`, or `1h`.
+
+The timeout applies when the command is first executed. If a result already
+exists for the key and command, once replays that stored result; changing
+`--timeout` later does not rerun it. Timeout is not a sandbox or transaction
+boundary. Commands that spawn or detach child processes can still leave work
+behind after the parent command is stopped.
 
 For stuck `running` records and terminal cleanup, see the
 [`repair cookbook`](docs/repair-cookbook.md).
