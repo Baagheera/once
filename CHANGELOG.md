@@ -4,6 +4,10 @@ User-facing changes are recorded here as releases are prepared.
 
 ## Unreleased
 
+No unreleased changes.
+
+## v0.3.1 - 2026-07-02
+
 ### Added
 
 - CLI `get --include-output` option for explicit single-record stdout/stderr
@@ -12,6 +16,7 @@ User-facing changes are recorded here as releases are prepared.
 ### Changed
 
 - Security policy now names the latest `v0.3.x` line as supported.
+- Documentation now calls out the 1 MiB HTTP JSON request body limit.
 
 ## v0.3.0 - 2026-07-01
 
