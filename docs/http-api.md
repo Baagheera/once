@@ -17,6 +17,9 @@ All endpoints except `GET /healthz` require:
 Authorization: Bearer <token>
 ```
 
+JSON request bodies are capped at 1 MiB. Base64 output in commit requests
+counts toward that limit.
+
 ## Reserve
 
 ```http

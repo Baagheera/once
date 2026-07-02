@@ -221,17 +221,34 @@ func statusCommand(args []string, storePath string, stdout, stderr io.Writer) in
 }
 
 func getCommand(args []string, storePath string, stdout, stderr io.Writer) int {
-	if len(args) != 1 {
+	includeOutput := false
+	var operands []string
+	if len(args) == 1 {
+		operands = args
+	} else {
+		for i := 0; i < len(args); i++ {
+			if args[i] == "--" {
+				operands = append(operands, args[i+1:]...)
+				break
+			}
+			if args[i] == "--include-output" {
+				includeOutput = true
+				continue
+			}
+			operands = append(operands, args[i])
+		}
+	}
+	if len(operands) != 1 {
 		fmt.Fprintln(stderr, "once: get needs exactly one key")
 		return 2
 	}
 
-	rec, code := loadRecord(storePath, args[0], stderr)
+	rec, code := loadRecord(storePath, operands[0], stderr)
 	if code != 0 {
 		return code
 	}
 
-	data, err := json.MarshalIndent(recordDoc(rec, false), "", "  ")
+	data, err := json.MarshalIndent(recordDoc(rec, includeOutput), "", "  ")
 	if err != nil {
 		fmt.Fprintf(stderr, "once: encode: %v\n", err)
 		return 1
@@ -817,7 +834,7 @@ func usage(w io.Writer) {
 		"  once [--store PATH] run --key KEY [--timeout DURATION] [--max-output-bytes N] -- COMMAND [ARG...]",
 		"  once [--store PATH] serve [--listen ADDR] [--token TOKEN | --token-file PATH]",
 		"  once [--store PATH] status KEY",
-		"  once [--store PATH] get KEY",
+		"  once [--store PATH] get [--include-output] KEY",
 		"  once [--store PATH] doctor",
 		"  once [--store PATH] list [--state STATE] [--limit N]",
 		"  once [--store PATH] export [--state STATE] [--limit N] [--include-output]",
