@@ -136,7 +136,7 @@ outside the command arguments. Put that identity in the key today.
 once run --key KEY [--timeout DURATION] [--max-output-bytes N] -- COMMAND [ARG...]
 once serve [--listen ADDR] [--token-file PATH]
 once status KEY
-once get KEY
+once get [--include-output] KEY
 once doctor
 once list [--state STATE] [--limit N]
 once export [--state STATE] [--limit N] [--include-output]
@@ -155,10 +155,10 @@ schema, and default token-file state. It reports problems and skipped checks;
 it does not repair the store, print token contents, or print stored command
 output.
 
-`list` prints a local summary of records for operators. `export` writes JSONL,
-one record per line, for scripts and audit trails. It omits stored stdout and
-stderr by default; use `--include-output` only when those bytes are safe to
-handle.
+`list` prints a local summary of records for operators. `get` prints one record
+as JSON. `export` writes JSONL, one record per line, for scripts and audit
+trails. Both `get` and `export` omit stored stdout and stderr by default; use
+`--include-output` only when those bytes are safe to handle.
 
 `prune` finds terminal records updated more than `DURATION` ago in the local
 store. It requires `--state succeeded` or `--state failed`; durations can use
@@ -205,6 +205,9 @@ Every endpoint except `/healthz` requires:
 Authorization: Bearer <token>
 ```
 
+JSON request bodies are capped at 1 MiB. Base64 output in commit requests
+counts toward that limit.
+
 For local testing:
 
 ```sh
@@ -237,8 +240,9 @@ curl -s http://127.0.0.1:7410/v1/records/webhook:event-123 \
   -H "authorization: Bearer $token"
 ```
 
-Byte fields such as `stdout_b64` and `stderr_b64` are JSON base64 strings. The HTTP
-server does not run commands; it only stores and returns idempotency records.
+Byte fields such as `stdout_b64` and `stderr_b64` are JSON base64 strings. The
+HTTP server does not run commands; it only stores and returns idempotency
+records.
 
 Deleting over HTTP requires the reservation token in `X-Once-Attempt-Token`.
 Deleting a `running` record also requires `?force=1`. The local CLI keeps

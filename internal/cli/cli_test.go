@@ -896,6 +896,137 @@ func TestExportJSONLRedactsOutputByDefault(t *testing.T) {
 	}
 }
 
+func TestGetRedactsOutputByDefault(t *testing.T) {
+	t.Setenv("ONCE_TEST_HELPER", "1")
+
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	cmd := helperCommand("stdout", "6")
+
+	var out, errOut bytes.Buffer
+	code := Run(append([]string{"--store", storePath, "run", "--key", "demo", "--"}, cmd...), &out, &errOut)
+	if code != 0 {
+		t.Fatalf("run code = %d stderr = %s", code, errOut.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"--store", storePath, "get", "demo"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("get code = %d stderr = %s", code, errOut.String())
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(out.Bytes(), &doc); err != nil {
+		t.Fatalf("decode get json: %v\n%s", err, out.String())
+	}
+	if doc["key"] != "demo" || doc["state"] != "succeeded" {
+		t.Fatalf("get doc = %#v", doc)
+	}
+	if _, ok := doc["stdout_b64"]; ok {
+		t.Fatalf("stdout_b64 should be omitted by default: %#v", doc)
+	}
+	if _, ok := doc["stderr_b64"]; ok {
+		t.Fatalf("stderr_b64 should be omitted by default: %#v", doc)
+	}
+}
+
+func TestGetIncludeOutput(t *testing.T) {
+	t.Setenv("ONCE_TEST_HELPER", "1")
+
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	cmd := helperCommand("stdout", "6")
+
+	var out, errOut bytes.Buffer
+	code := Run(append([]string{"--store", storePath, "run", "--key", "demo", "--"}, cmd...), &out, &errOut)
+	if code != 0 {
+		t.Fatalf("run code = %d stderr = %s", code, errOut.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"--store", storePath, "get", "--include-output", "demo"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("get --include-output code = %d stderr = %s", code, errOut.String())
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(out.Bytes(), &doc); err != nil {
+		t.Fatalf("decode get json: %v\n%s", err, out.String())
+	}
+	if doc["stdout_b64"] != base64.StdEncoding.EncodeToString([]byte("xxxxxx")) {
+		t.Fatalf("stdout_b64 = %#v", doc["stdout_b64"])
+	}
+	if value, ok := doc["stderr_b64"]; !ok || value != "" {
+		t.Fatalf("stderr_b64 = %#v, present=%v", value, ok)
+	}
+}
+
+func TestGetAcceptsDashPrefixedKey(t *testing.T) {
+	t.Setenv("ONCE_TEST_HELPER", "1")
+
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	cmd := helperCommand("stdout", "2")
+
+	var out, errOut bytes.Buffer
+	code := Run(append([]string{"--store", storePath, "run", "--key", "-demo", "--"}, cmd...), &out, &errOut)
+	if code != 0 {
+		t.Fatalf("run code = %d stderr = %s", code, errOut.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"--store", storePath, "get", "-demo"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("get code = %d stderr = %s", code, errOut.String())
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(out.Bytes(), &doc); err != nil {
+		t.Fatalf("decode get json: %v\n%s", err, out.String())
+	}
+	if doc["key"] != "-demo" {
+		t.Fatalf("key = %#v", doc["key"])
+	}
+}
+
+func TestGetAcceptsFlagNamedKey(t *testing.T) {
+	t.Setenv("ONCE_TEST_HELPER", "1")
+
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	cmd := helperCommand("stdout", "2")
+
+	var out, errOut bytes.Buffer
+	code := Run(append([]string{"--store", storePath, "run", "--key", "--include-output", "--"}, cmd...), &out, &errOut)
+	if code != 0 {
+		t.Fatalf("run code = %d stderr = %s", code, errOut.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"--store", storePath, "get", "--include-output"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("get code = %d stderr = %s", code, errOut.String())
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(out.Bytes(), &doc); err != nil {
+		t.Fatalf("decode get json: %v\n%s", err, out.String())
+	}
+	if doc["key"] != "--include-output" {
+		t.Fatalf("key = %#v", doc["key"])
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"--store", storePath, "get", "--include-output", "--", "--include-output"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("get --include-output code = %d stderr = %s", code, errOut.String())
+	}
+	doc = map[string]any{}
+	if err := json.Unmarshal(out.Bytes(), &doc); err != nil {
+		t.Fatalf("decode get json: %v\n%s", err, out.String())
+	}
+	if doc["stdout_b64"] != base64.StdEncoding.EncodeToString([]byte("xx")) {
+		t.Fatalf("stdout_b64 = %#v", doc["stdout_b64"])
+	}
+}
+
 func TestListAndExportRejectInvalidFilters(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "once.db")
 

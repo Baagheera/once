@@ -4,7 +4,14 @@ User-facing changes are recorded here as releases are prepared.
 
 ## Unreleased
 
-No unreleased changes.
+### Added
+
+- CLI `get --include-output` option for explicit single-record stdout/stderr
+  inspection.
+
+### Changed
+
+- Security policy now names the latest `v0.3.x` line as supported.
 
 ## v0.3.0 - 2026-07-01
 
