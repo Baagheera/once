@@ -10,6 +10,9 @@ command again.
 The same key with a different command is rejected. This catches a common class
 of accidental key reuse bugs early.
 
+Keys are exact ASCII identifiers. once does not trim or normalize them before
+reservation or lookup.
+
 Each fresh reservation also gets an opaque attempt token. The token is stored
 only as a hash and is required to commit the result. This prevents a different
 client that merely knows the key from finalizing someone else's in-flight

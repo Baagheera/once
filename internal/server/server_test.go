@@ -234,6 +234,15 @@ func TestRejectsInvalidKey(t *testing.T) {
 	}
 }
 
+func TestRejectsKeyWithSurroundingWhitespace(t *testing.T) {
+	handler := newTestHandler(t)
+
+	res := request(t, handler, "POST", "/v1/reserve", `{"key":" demo "}`)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+}
+
 func TestDeleteMissingReturnsNotFound(t *testing.T) {
 	handler := newTestHandler(t)
 

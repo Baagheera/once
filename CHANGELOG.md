@@ -4,7 +4,18 @@ User-facing changes are recorded here as releases are prepared.
 
 ## Unreleased
 
-No unreleased changes.
+### Added
+
+- `doctor` now warns about Unix-like store parent directories with broad
+  permissions.
+
+### Changed
+
+- Idempotency keys are now limited to ASCII letters, digits, `.`, `_`, `:`,
+  `@`, `=`, and `-`.
+- HTTP key handling now rejects surrounding whitespace instead of trimming it.
+- Documentation now recommends private store directories and clearer handling
+  for non-local HTTP listeners.
 
 ## v0.3.1 - 2026-07-02
 

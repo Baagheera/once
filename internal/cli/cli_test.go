@@ -578,6 +578,62 @@ func TestDoctorDoesNotCreateMissingStore(t *testing.T) {
 	}
 }
 
+func TestDoctorWarnsForBroadStoreParent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows ACL checks use a separate path")
+	}
+
+	dir := filepath.Join(t.TempDir(), "shared")
+	if err := os.Mkdir(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	storePath := filepath.Join(dir, "once.db")
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "doctor"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("doctor code = %d stdout = %s stderr = %s", code, out.String(), errOut.String())
+	}
+	output := out.String()
+	if !strings.Contains(output, "store parent: warn") {
+		t.Fatalf("doctor output missing parent warning:\n%s", output)
+	}
+	if !strings.Contains(output, "wider than 0700") {
+		t.Fatalf("doctor output missing permission detail:\n%s", output)
+	}
+}
+
+func TestDoctorWarnsForBroadCurrentDirectoryStoreParent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows ACL checks use a separate path")
+	}
+
+	dir := filepath.Join(t.TempDir(), "shared")
+	if err := os.Mkdir(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", "once.db", "doctor"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("doctor code = %d stdout = %s stderr = %s", code, out.String(), errOut.String())
+	}
+	output := out.String()
+	if !strings.Contains(output, "store parent: warn") {
+		t.Fatalf("doctor output missing parent warning:\n%s", output)
+	}
+	if !strings.Contains(output, "wider than 0700") {
+		t.Fatalf("doctor output missing permission detail:\n%s", output)
+	}
+}
+
 func TestDoctorRejectsSQLiteDSNPath(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := Run([]string{"--store", "file:once.db?mode=ro", "doctor"}, &out, &errOut)

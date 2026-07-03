@@ -31,7 +31,8 @@ metadata and output, and delete records.
 
 Do not expose `once serve` to an untrusted network. The server requires a bearer
 token by default; keep it secret and put the server behind your own transport
-security if it leaves localhost.
+security and access controls if it leaves localhost. The HTTP API is meant to
+be a small local or trusted-network control plane, not a public edge service.
 
 Keys, command arguments, stdout, stderr and error strings may contain sensitive
 data. Treat the SQLite store as sensitive.

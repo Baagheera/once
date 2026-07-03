@@ -36,6 +36,10 @@ func doctorFilePermissionProblem(path string, _ os.FileInfo) string {
 	return ""
 }
 
+func doctorDirectoryPermissionProblem(_ string, _ os.FileInfo) string {
+	return ""
+}
+
 func aclBroadFileAccess(dacl *windows.ACL) (string, error) {
 	broadSIDs, err := broadWindowsSIDs()
 	if err != nil {

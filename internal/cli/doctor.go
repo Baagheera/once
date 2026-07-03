@@ -115,8 +115,8 @@ func cleanDoctorStorePath(path string) (string, error) {
 
 func doctorCheckParent(path string) doctorCheck {
 	dir := filepath.Dir(path)
-	if dir == "." || dir == "" {
-		return doctorCheck{name: "store parent", level: doctorOK, detail: "current directory"}
+	if dir == "" {
+		dir = "."
 	}
 	if err := once.RejectSymlinkPath(dir); err != nil {
 		return doctorCheck{name: "store parent", level: doctorFail, detail: err.Error()}
@@ -126,6 +126,12 @@ func doctorCheckParent(path string) doctorCheck {
 	if err == nil {
 		if !info.IsDir() {
 			return doctorCheck{name: "store parent", level: doctorFail, detail: fmt.Sprintf("%s is not a directory", dir)}
+		}
+		if detail := doctorDirectoryPermissionProblem(dir, info); detail != "" {
+			return doctorCheck{name: "store parent", level: doctorWarn, detail: detail}
+		}
+		if dir == "." {
+			return doctorCheck{name: "store parent", level: doctorOK, detail: "current directory"}
 		}
 		return doctorCheck{name: "store parent", level: doctorOK, detail: dir}
 	}
