@@ -64,6 +64,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return pruneCommand(args[1:], storePath, stdout, stderr)
 	case "forget":
 		return forgetCommand(args[1:], storePath, stdout, stderr)
+	case "version":
+		return versionCommand(args[1:], stdout, stderr)
 	case "help", "-h", "--help":
 		usage(stdout)
 		return 0
@@ -840,6 +842,7 @@ func usage(w io.Writer) {
 		"  once [--store PATH] export [--state STATE] [--limit N] [--include-output]",
 		"  once [--store PATH] prune --state STATE --older-than DURATION [--force]",
 		"  once [--store PATH] forget [--force] KEY",
+		"  once version",
 	}
 	fmt.Fprintln(w, strings.Join(lines, "\n"))
 }

@@ -4,7 +4,9 @@ User-facing changes are recorded here as releases are prepared.
 
 ## Unreleased
 
-No unreleased changes.
+### Added
+
+- `once version` command for printing the CLI version.
 
 ## v0.4.1 - 2026-07-03
 
