@@ -155,7 +155,7 @@ ASCII letters, digits, `.`, `_`, `:`, `@`, `=`, and `-`, up to 256 bytes.
 | `once export [--state STATE] [--limit N] [--include-output]` | write JSONL for scripts or audits |
 | `once prune --state STATE --older-than DURATION [--force]` | dry-run or delete old terminal records |
 | `once forget [--force] KEY` | delete one record deliberately |
-| `once doctor` | inspect local store, permissions, schema, and token-file state |
+| `once doctor [--json]` | inspect local store, permissions, schema, and token-file state |
 | `once serve [--listen ADDR] [--token-file PATH]` | expose reserve/commit/get/delete over HTTP |
 
 Global flags:
@@ -167,7 +167,8 @@ Global flags:
 `doctor` checks the local store path, parent directory, file permissions,
 SQLite sidecar files, schema, and default token-file state. It reports problems
 and skipped checks; it does not repair the store, print token contents, or
-print stored command output.
+print stored command output. Use `--json` when another program needs the same
+checks.
 
 `list` prints a local summary of records for operators. `get` prints one record
 as JSON. `export` writes JSONL, one record per line, for scripts and audit

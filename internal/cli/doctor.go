@@ -2,6 +2,7 @@ package cli
 
 import (
 	"database/sql"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -29,9 +30,21 @@ type doctorCheck struct {
 	detail string
 }
 
+type doctorJSON struct {
+	OK     bool              `json:"ok"`
+	Checks []doctorJSONCheck `json:"checks"`
+}
+
+type doctorJSONCheck struct {
+	Name   string      `json:"name"`
+	Level  doctorLevel `json:"level"`
+	Detail string      `json:"detail,omitempty"`
+}
+
 func doctorCommand(args []string, storePath string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	jsonOutput := fs.Bool("json", false, "write checks as JSON")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -40,16 +53,32 @@ func doctorCommand(args []string, storePath string, stdout, stderr io.Writer) in
 		return 2
 	}
 
+	checks := runDoctor(storePath)
 	failed := false
-	for _, check := range runDoctor(storePath) {
+	for _, check := range checks {
+		if check.level == doctorFail {
+			failed = true
+			break
+		}
+	}
+
+	if *jsonOutput {
+		if err := json.NewEncoder(stdout).Encode(doctorJSONDoc(checks, !failed)); err != nil {
+			fmt.Fprintf(stderr, "once: doctor: %v\n", err)
+			return 1
+		}
+		if failed {
+			return 1
+		}
+		return 0
+	}
+
+	for _, check := range checks {
 		fmt.Fprintf(stdout, "%s: %s", check.name, check.level)
 		if check.detail != "" {
 			fmt.Fprintf(stdout, " - %s", check.detail)
 		}
 		fmt.Fprintln(stdout)
-		if check.level == doctorFail {
-			failed = true
-		}
 	}
 	if failed {
 		fmt.Fprintln(stdout, "doctor: failed")
@@ -57,6 +86,21 @@ func doctorCommand(args []string, storePath string, stdout, stderr io.Writer) in
 	}
 	fmt.Fprintln(stdout, "doctor: ok")
 	return 0
+}
+
+func doctorJSONDoc(checks []doctorCheck, ok bool) doctorJSON {
+	doc := doctorJSON{
+		OK:     ok,
+		Checks: make([]doctorJSONCheck, 0, len(checks)),
+	}
+	for _, check := range checks {
+		doc.Checks = append(doc.Checks, doctorJSONCheck{
+			Name:   check.name,
+			Level:  check.level,
+			Detail: check.detail,
+		})
+	}
+	return doc
 }
 
 func runDoctor(storePath string) []doctorCheck {

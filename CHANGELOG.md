@@ -4,7 +4,9 @@ User-facing changes are recorded here as releases are prepared.
 
 ## Unreleased
 
-No unreleased changes.
+### Added
+
+- `doctor --json` for machine-readable local diagnostics.
 
 ## v0.4.0 - 2026-07-03
 

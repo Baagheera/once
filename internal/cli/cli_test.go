@@ -555,6 +555,37 @@ func TestDoctorReportsHealthyStore(t *testing.T) {
 	}
 }
 
+func TestDoctorReportsHealthyStoreAsJSON(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "doctor", "--json"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("doctor code = %d stdout = %s stderr = %s", code, out.String(), errOut.String())
+	}
+	if errOut.Len() != 0 {
+		t.Fatalf("stderr = %q", errOut.String())
+	}
+
+	doc := decodeDoctorJSON(t, out.String())
+	if !doc.OK {
+		t.Fatalf("doctor json ok = false: %#v", doc)
+	}
+	requireDoctorJSONCheck(t, doc, "store path", "ok")
+	requireDoctorJSONCheck(t, doc, "sqlite open", "ok")
+	requireDoctorJSONCheck(t, doc, "sqlite schema", "ok")
+	if strings.Contains(out.String(), "doctor: ok") {
+		t.Fatalf("doctor json should not include text summary:\n%s", out.String())
+	}
+}
+
 func TestDoctorDoesNotCreateMissingStore(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "missing")
 	storePath := filepath.Join(dir, "once.db")
@@ -706,6 +737,40 @@ func TestDoctorRejectsBadSQLiteSidecar(t *testing.T) {
 	if !strings.Contains(out.String(), "sqlite wal: fail") {
 		t.Fatalf("stdout = %q", out.String())
 	}
+}
+
+func TestDoctorReportsFailureAsJSON(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, sidecar := range []string{storePath + "-wal", storePath + "-shm"} {
+		if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(storePath+"-wal", 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "doctor", "--json"}, &out, &errOut)
+	if code != 1 {
+		t.Fatalf("doctor code = %d stdout = %s stderr = %s", code, out.String(), errOut.String())
+	}
+	if errOut.Len() != 0 {
+		t.Fatalf("stderr = %q", errOut.String())
+	}
+
+	doc := decodeDoctorJSON(t, out.String())
+	if doc.OK {
+		t.Fatalf("doctor json ok = true: %#v", doc)
+	}
+	requireDoctorJSONCheck(t, doc, "sqlite wal", "fail")
 }
 
 func TestDoctorRejectsOrphanSQLiteSidecar(t *testing.T) {
@@ -1522,4 +1587,44 @@ func decodeExport(t *testing.T, output string) []map[string]any {
 		docs = append(docs, doc)
 	}
 	return docs
+}
+
+type doctorJSONOutput struct {
+	OK     bool                    `json:"ok"`
+	Checks []doctorJSONOutputCheck `json:"checks"`
+}
+
+type doctorJSONOutputCheck struct {
+	Name   string `json:"name"`
+	Level  string `json:"level"`
+	Detail string `json:"detail"`
+}
+
+func decodeDoctorJSON(t *testing.T, output string) doctorJSONOutput {
+	t.Helper()
+
+	var doc doctorJSONOutput
+	if err := json.Unmarshal([]byte(output), &doc); err != nil {
+		t.Fatalf("decode doctor json %q: %v", output, err)
+	}
+	if len(doc.Checks) == 0 {
+		t.Fatalf("doctor json checks are empty: %q", output)
+	}
+	return doc
+}
+
+func requireDoctorJSONCheck(t *testing.T, doc doctorJSONOutput, name, level string) doctorJSONOutputCheck {
+	t.Helper()
+
+	for _, check := range doc.Checks {
+		if check.Name != name {
+			continue
+		}
+		if check.Level != level {
+			t.Fatalf("doctor json check %q level = %q, want %q", name, check.Level, level)
+		}
+		return check
+	}
+	t.Fatalf("doctor json missing check %q: %#v", name, doc.Checks)
+	return doctorJSONOutputCheck{}
 }
