@@ -8,6 +8,11 @@ User-facing changes are recorded here as releases are prepared.
 
 - `once version` command for printing the CLI version.
 
+### Changed
+
+- Documentation now includes common usage patterns and a clearer HTTP API
+  reference.
+
 ## v0.4.1 - 2026-07-03
 
 ### Added

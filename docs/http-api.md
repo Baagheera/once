@@ -27,6 +27,16 @@ counts toward that limit.
 Keys are exact identifiers. The server does not trim or normalize them. Use
 ASCII letters, digits, `.`, `_`, `:`, `@`, `=`, and `-`, up to 256 bytes.
 
+## Endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/healthz` | return server health without authentication |
+| `POST` | `/v1/reserve` | reserve a key or return the existing record |
+| `POST` | `/v1/commit` | commit a terminal result for a running key |
+| `GET` | `/v1/records/{key}` | fetch one record |
+| `DELETE` | `/v1/records/{key}` | delete one record for deliberate repair |
+
 ## Reserve
 
 ```http
@@ -59,6 +69,10 @@ Response:
 If `fresh` is false, the key already existed and the returned record should be
 replayed instead of performing the side effect again.
 
+`attempt_token` is returned only for a fresh reservation. Keep it until the
+caller either commits the terminal result or decides to delete the record as a
+manual repair.
+
 ## Commit
 
 ```http
@@ -78,6 +92,8 @@ Request:
 ```
 
 `stdout_b64` and `stderr_b64` are base64 encoded byte fields.
+
+Commit only accepts terminal states: `succeeded` and `failed`.
 
 ## Get
 
@@ -100,3 +116,24 @@ X-Once-Attempt-Token: opaque-token
 
 Running records are additionally protected. Use `?force=1` to delete a running
 record deliberately.
+
+Example:
+
+```sh
+curl -X DELETE \
+  "http://127.0.0.1:7410/v1/records/webhook:event-123?force=1" \
+  -H "authorization: Bearer $token" \
+  -H "X-Once-Attempt-Token: $attempt_token"
+```
+
+## Common status codes
+
+| Code | Meaning |
+| --- | --- |
+| `200` | request succeeded and returned JSON |
+| `204` | delete succeeded and returned no body |
+| `400` | invalid JSON, invalid key, invalid commit, or missing delete token |
+| `401` | missing or invalid bearer token |
+| `404` | record not found |
+| `409` | key conflict, stale commit token, or protected running record |
+| `415` | JSON endpoint called without `Content-Type: application/json` |

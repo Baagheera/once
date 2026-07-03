@@ -75,6 +75,33 @@ Put the store in a directory owned by the app or by the user running it. Avoid
 shared temporary directories for real side effects; the database, WAL/SHM
 sidecars, and token file are all sensitive local files.
 
+## Common patterns
+
+Key by the side effect, not by the retry attempt:
+
+```sh
+once run --key email:user42:welcome -- ./send-welcome-email user42
+once run --key webhook:stripe:event_123 -- ./deliver-webhook event_123
+```
+
+Use a key that would still be correct if the process crashed and a different
+operator retried it later. If environment variables, input files, tenant IDs,
+or remote event IDs change the side effect, put that identity in the key.
+
+Keep the store with the app state that owns the side effect:
+
+```sh
+once --store "$HOME/.local/state/myapp/once.db" run --key deploy:prod:2026-07-03 -- ./notify-deploy prod
+```
+
+Inspect before repair. A `running` record means once does not know whether the
+outside world changed. Start with `once list --state running`, then `once get
+KEY`, and only use `forget --force` when you have decided the retry is safe.
+
+Use HTTP mode when another process needs to reserve and commit records but
+should not execute local commands. Keep it bound to localhost or behind your
+own trusted network controls.
+
 ## States
 
 `running`
