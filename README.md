@@ -1,9 +1,9 @@
 # once
 
-once is a small persistent log for side effects.
+once is a small SQLite-backed idempotency log for side effects.
 
-It solves a boring problem: retries are useful, but duplicated side effects
-are not.
+Run the side effect once. Store the terminal result. Replay that result on
+later attempts with the same key.
 
 ```sh
 once run --key email:user42:welcome -- ./send-welcome-email user42
@@ -32,6 +32,13 @@ The model is:
 
 The store is a SQLite database. By default it uses `once.db` in the current
 directory.
+
+Good fits:
+
+- sending an email from a script
+- calling a webhook from a deploy step
+- recording the result of a one-off local side effect
+- wrapping a command where retrying is useful but duplicating work is not
 
 ## Quick start
 
@@ -139,17 +146,17 @@ ASCII letters, digits, `.`, `_`, `:`, `@`, `=`, and `-`, up to 256 bytes.
 
 ## Commands
 
-```sh
-once run --key KEY [--timeout DURATION] [--max-output-bytes N] -- COMMAND [ARG...]
-once serve [--listen ADDR] [--token-file PATH]
-once status KEY
-once get [--include-output] KEY
-once doctor
-once list [--state STATE] [--limit N]
-once export [--state STATE] [--limit N] [--include-output]
-once prune --state STATE --older-than DURATION [--force]
-once forget [--force] KEY
-```
+| Command | Purpose |
+| --- | --- |
+| `once run --key KEY -- COMMAND [ARG...]` | reserve a key, run a command, store and replay its result |
+| `once status KEY` | print the state for one key |
+| `once get [--include-output] KEY` | print one record as JSON |
+| `once list [--state STATE] [--limit N]` | list local records for operators |
+| `once export [--state STATE] [--limit N] [--include-output]` | write JSONL for scripts or audits |
+| `once prune --state STATE --older-than DURATION [--force]` | dry-run or delete old terminal records |
+| `once forget [--force] KEY` | delete one record deliberately |
+| `once doctor` | inspect local store, permissions, schema, and token-file state |
+| `once serve [--listen ADDR] [--token-file PATH]` | expose reserve/commit/get/delete over HTTP |
 
 Global flags:
 
