@@ -835,7 +835,7 @@ func usage(w io.Writer) {
 		"  once [--store PATH] serve [--listen ADDR] [--token TOKEN | --token-file PATH]",
 		"  once [--store PATH] status KEY",
 		"  once [--store PATH] get [--include-output] KEY",
-		"  once [--store PATH] doctor",
+		"  once [--store PATH] doctor [--json]",
 		"  once [--store PATH] list [--state STATE] [--limit N]",
 		"  once [--store PATH] export [--state STATE] [--limit N] [--include-output]",
 		"  once [--store PATH] prune --state STATE --older-than DURATION [--force]",
