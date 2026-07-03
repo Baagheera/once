@@ -233,7 +233,6 @@ func requireJSON(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func validKey(w http.ResponseWriter, key string) (string, bool) {
-	key = strings.TrimSpace(key)
 	if err := once.ValidateKey(key); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid key")
 		return "", false

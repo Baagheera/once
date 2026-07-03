@@ -11,6 +11,10 @@ path. Read that file, or pass `--token-file` for scripted use. Tokens passed
 through flags or environment variables can be visible to other local processes
 on shared machines. Explicit `--token` values must be at least 32 characters.
 
+Do not put `once serve` directly on an untrusted network. If it needs to listen
+beyond localhost, keep it on a trusted network or put it behind your own TLS
+and access controls.
+
 All endpoints except `GET /healthz` require:
 
 ```http
@@ -19,6 +23,9 @@ Authorization: Bearer <token>
 
 JSON request bodies are capped at 1 MiB. Base64 output in commit requests
 counts toward that limit.
+
+Keys are exact identifiers. The server does not trim or normalize them. Use
+ASCII letters, digits, `.`, `_`, `:`, `@`, `=`, and `-`, up to 256 bytes.
 
 ## Reserve
 

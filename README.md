@@ -61,8 +61,12 @@ results, and the HTTP reserve/commit/replay flow.
 Use a different database:
 
 ```sh
-once --store /tmp/once.db run --key payment:order-123 -- ./charge order-123
+once --store "$HOME/.local/state/myapp/once.db" run --key payment:order-123 -- ./charge order-123
 ```
+
+Put the store in a directory owned by the app or by the user running it. Avoid
+shared temporary directories for real side effects; the database, WAL/SHM
+sidecars, and token file are all sensitive local files.
 
 ## States
 
@@ -130,6 +134,9 @@ The command line is stored to catch accidental key reuse, but once cannot infer
 changes in environment variables, input files, remote state, or other context
 outside the command arguments. Put that identity in the key today.
 
+Keys are exact identifiers. once does not trim or normalize them. Keys may use
+ASCII letters, digits, `.`, `_`, `:`, `@`, `=`, and `-`, up to 256 bytes.
+
 ## Commands
 
 ```sh
@@ -150,10 +157,10 @@ Global flags:
 --store PATH    SQLite database path. Default: once.db
 ```
 
-`doctor` checks the local store path, file permissions, SQLite sidecar files,
-schema, and default token-file state. It reports problems and skipped checks;
-it does not repair the store, print token contents, or print stored command
-output.
+`doctor` checks the local store path, parent directory, file permissions,
+SQLite sidecar files, schema, and default token-file state. It reports problems
+and skipped checks; it does not repair the store, print token contents, or
+print stored command output.
 
 `list` prints a local summary of records for operators. `get` prints one record
 as JSON. `export` writes JSONL, one record per line, for scripts and audit
@@ -251,7 +258,9 @@ direct access to the SQLite database.
 
 Do not expose `once serve` to untrusted networks. Non-loopback listeners require
 `--allow-remote`, and bearer authentication is still required unless auth is
-explicitly disabled on a loopback address with `--unsafe-no-auth`.
+explicitly disabled on a loopback address with `--unsafe-no-auth`. If you bind
+it beyond localhost, keep it on a trusted network or put it behind your own TLS
+and access controls.
 
 ## Non-goals
 
