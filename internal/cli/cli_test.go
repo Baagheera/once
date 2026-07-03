@@ -80,6 +80,51 @@ func TestStatus(t *testing.T) {
 	}
 }
 
+func TestVersion(t *testing.T) {
+	oldVersion := version
+	version = "v1.2.3"
+	t.Cleanup(func() {
+		version = oldVersion
+	})
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"version"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("version code = %d stderr = %s", code, errOut.String())
+	}
+	if out.String() != "once v1.2.3\n" {
+		t.Fatalf("version stdout = %q", out.String())
+	}
+	if errOut.Len() != 0 {
+		t.Fatalf("stderr = %q", errOut.String())
+	}
+}
+
+func TestVersionRejectsArguments(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := Run([]string{"version", "extra"}, &out, &errOut)
+	if code != 2 {
+		t.Fatalf("version code = %d stderr = %s", code, errOut.String())
+	}
+	if out.Len() != 0 {
+		t.Fatalf("stdout = %q", out.String())
+	}
+	if !strings.Contains(errOut.String(), "version does not take positional arguments") {
+		t.Fatalf("stderr = %q", errOut.String())
+	}
+}
+
+func TestHelpIncludesVersion(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := Run([]string{"help"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("help code = %d stderr = %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "once version") {
+		t.Fatalf("help output missing version command:\n%s", out.String())
+	}
+}
+
 func TestRunReplaysSavedFailure(t *testing.T) {
 	store := filepath.Join(t.TempDir(), "once.db")
 

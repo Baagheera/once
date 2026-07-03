@@ -157,6 +157,7 @@ ASCII letters, digits, `.`, `_`, `:`, `@`, `=`, and `-`, up to 256 bytes.
 | `once forget [--force] KEY` | delete one record deliberately |
 | `once doctor [--json]` | inspect local store, permissions, schema, and token-file state |
 | `once serve [--listen ADDR] [--token-file PATH]` | expose reserve/commit/get/delete over HTTP |
+| `once version` | print the CLI version |
 
 Global flags:
 
