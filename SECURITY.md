@@ -10,7 +10,7 @@ practical.
 Currently supported:
 
 - `main`
-- latest `v0.3.x`
+- latest `v0.4.x`
 
 Older experimental releases may be superseded instead of patched. The public API
 and storage format may still change before `v1.0.0`.
