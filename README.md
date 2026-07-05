@@ -2,8 +2,13 @@
 
 once is a small SQLite-backed idempotency log for side effects.
 
-Run the side effect once. Store the terminal result. Replay that result on
-later attempts with the same key.
+Use it when a script may be retried, but duplicating the side effect would be a
+bug.
+
+The normal case is simple: reserve a stable key, run the command, store the
+terminal result, and replay that result on later attempts with the same key.
+once does not make the outside world exactly-once; crash uncertainty stays
+visible as a `running` record.
 
 ```sh
 once run --key email:user42:welcome -- ./send-welcome-email user42
@@ -16,6 +21,19 @@ the saved exit code.
 
 If the same key is reused with a different command, once returns an error. A
 key should name one operation, not a family of similar operations.
+
+Small demo:
+
+```sh
+tmp="$(mktemp -d)"
+once --store "$tmp/once.db" run --key webhook:event-123 -- \
+  sh -c 'echo POST >> "$1"; echo ok' sh "$tmp/side-effects.log"
+once --store "$tmp/once.db" run --key webhook:event-123 -- \
+  sh -c 'echo POST >> "$1"; echo ok' sh "$tmp/side-effects.log"
+wc -l < "$tmp/side-effects.log"
+```
+
+The command prints `ok` both times. The side-effect log has one line.
 
 ## What it is
 
@@ -39,6 +57,8 @@ Good fits:
 - calling a webhook from a deploy step
 - recording the result of a one-off local side effect
 - wrapping a command where retrying is useful but duplicating work is not
+
+For concrete recipes, see [`docs/cookbook.md`](docs/cookbook.md).
 
 ## Quick start
 
@@ -88,6 +108,19 @@ Use a key that would still be correct if the process crashed and a different
 operator retried it later. If environment variables, input files, tenant IDs,
 or remote event IDs change the side effect, put that identity in the key.
 
+Good keys usually name the external operation:
+
+- `email:user42:welcome`
+- `webhook:stripe:event_123`
+- `deploy:prod:2026-07-03:notify`
+- `charge:order_123`
+
+Weak keys usually name the attempt:
+
+- `retry-1`
+- `send-email`
+- `today`
+
 Keep the store with the app state that owns the side effect:
 
 ```sh
@@ -135,6 +168,36 @@ becomes a record you can inspect.
 For concrete crash cases, see
 [`docs/failure-model.md`](docs/failure-model.md). For operational repair steps,
 see [`docs/repair-cookbook.md`](docs/repair-cookbook.md).
+
+## Why not ...
+
+`flock` or a lock file?
+
+A lock can stop two processes from entering the same critical section at the
+same time. It does not store the terminal result, replay stdout/stderr, or keep
+a durable record that a previous attempt is uncertain.
+
+A job queue?
+
+Queues assign and deliver work. once does not. It records one operation by key
+and lets your program decide when to run, retry, inspect, or repair it.
+
+An outbox table?
+
+Use an outbox when the side effect belongs inside your application database
+transaction and a worker can deliver it later. Use once when you need a small
+local ledger around an existing command or HTTP client flow.
+
+Provider idempotency keys?
+
+Use them when the provider supports them. once is useful around providers or
+commands that do not, and around local side effects where you still want a
+record to inspect.
+
+A workflow engine?
+
+If you need scheduling, background retries, timers, fan-out, compensation, or a
+long-running state machine, use a workflow engine. once is deliberately smaller.
 
 ## When not to use once
 
@@ -256,6 +319,11 @@ For local testing:
 ```sh
 token="$(cat once.db.token)"
 ```
+
+The `curl` examples below put the bearer token in the command arguments. That
+is convenient for local testing, but process arguments can be visible to other
+local users on shared machines. Use a private script, config file, or your own
+HTTP client code when that matters.
 
 Reserve a key:
 
