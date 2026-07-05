@@ -169,6 +169,11 @@ func serveCommand(args []string, storePath string, stdout, stderr io.Writer) int
 		return 2
 	}
 
+	if err := validateAuthConfig(*token, *tokenFile, *unsafeNoAuth); err != nil {
+		fmt.Fprintf(stderr, "once: auth token: %v\n", err)
+		return 2
+	}
+
 	store, err := once.OpenSQLite(storePath)
 	if err != nil {
 		fmt.Fprintf(stderr, "once: open store: %v\n", err)
@@ -767,6 +772,29 @@ func resolveAuthToken(flagToken, tokenFile string, unsafeNoAuth bool, storePath 
 	return token, defaultFile, err
 }
 
+func validateAuthConfig(flagToken, tokenFile string, unsafeNoAuth bool) error {
+	flagToken = strings.TrimSpace(flagToken)
+	tokenFile = strings.TrimSpace(tokenFile)
+	if unsafeNoAuth {
+		if flagToken != "" || tokenFile != "" {
+			return fmt.Errorf("--token and --token-file cannot be used with --unsafe-no-auth")
+		}
+		return nil
+	}
+	if flagToken != "" && tokenFile != "" {
+		return fmt.Errorf("--token and --token-file are mutually exclusive")
+	}
+	if flagToken != "" {
+		return validateAuthToken(flagToken)
+	}
+	if envToken := strings.TrimSpace(os.Getenv("ONCE_TOKEN")); envToken != "" {
+		if err := validateAuthToken(envToken); err != nil {
+			return fmt.Errorf("ONCE_TOKEN: %w", err)
+		}
+	}
+	return nil
+}
+
 func validateAuthToken(token string) error {
 	if len(token) < minAuthTokenLength {
 		return fmt.Errorf("token must be at least %d characters", minAuthTokenLength)
@@ -783,6 +811,9 @@ func loadOrCreateTokenFile(path string) (string, error) {
 	}
 	path = filepath.Clean(path)
 	if err := once.RejectSymlinkPath(path); err != nil {
+		return "", err
+	}
+	if err := once.RejectSharedWritableParent(path); err != nil {
 		return "", err
 	}
 
@@ -805,6 +836,9 @@ func loadOrCreateTokenFile(path string) (string, error) {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return "", err
 		}
+	}
+	if err := once.RejectSharedWritableParent(path); err != nil {
+		return "", err
 	}
 	if err := once.RejectSymlinkPath(path); err != nil {
 		return "", err

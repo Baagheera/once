@@ -117,6 +117,10 @@ X-Once-Attempt-Token: opaque-token
 Running records are additionally protected. Use `?force=1` to delete a running
 record deliberately.
 
+If the delete token is missing or malformed, the server returns `400`. If the
+token is well formed but does not match the record, the server returns `404`,
+the same response used for a missing key.
+
 Example:
 
 ```sh

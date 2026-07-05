@@ -654,7 +654,7 @@ func TestDoctorDoesNotCreateMissingStore(t *testing.T) {
 	}
 }
 
-func TestDoctorWarnsForBroadStoreParent(t *testing.T) {
+func TestDoctorFailsForBroadStoreParent(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows ACL checks use a separate path")
 	}
@@ -670,19 +670,19 @@ func TestDoctorWarnsForBroadStoreParent(t *testing.T) {
 
 	var out, errOut bytes.Buffer
 	code := Run([]string{"--store", storePath, "doctor"}, &out, &errOut)
-	if code != 0 {
+	if code != 1 {
 		t.Fatalf("doctor code = %d stdout = %s stderr = %s", code, out.String(), errOut.String())
 	}
 	output := out.String()
-	if !strings.Contains(output, "store parent: warn") {
-		t.Fatalf("doctor output missing parent warning:\n%s", output)
+	if !strings.Contains(output, "store parent: fail") {
+		t.Fatalf("doctor output missing parent failure:\n%s", output)
 	}
-	if !strings.Contains(output, "wider than 0700") {
+	if !strings.Contains(output, "allow group or other writes") {
 		t.Fatalf("doctor output missing permission detail:\n%s", output)
 	}
 }
 
-func TestDoctorWarnsForBroadCurrentDirectoryStoreParent(t *testing.T) {
+func TestDoctorFailsForBroadCurrentDirectoryStoreParent(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows ACL checks use a separate path")
 	}
@@ -698,14 +698,14 @@ func TestDoctorWarnsForBroadCurrentDirectoryStoreParent(t *testing.T) {
 
 	var out, errOut bytes.Buffer
 	code := Run([]string{"--store", "once.db", "doctor"}, &out, &errOut)
-	if code != 0 {
+	if code != 1 {
 		t.Fatalf("doctor code = %d stdout = %s stderr = %s", code, out.String(), errOut.String())
 	}
 	output := out.String()
-	if !strings.Contains(output, "store parent: warn") {
-		t.Fatalf("doctor output missing parent warning:\n%s", output)
+	if !strings.Contains(output, "store parent: fail") {
+		t.Fatalf("doctor output missing parent failure:\n%s", output)
 	}
-	if !strings.Contains(output, "wider than 0700") {
+	if !strings.Contains(output, "allow group or other writes") {
 		t.Fatalf("doctor output missing permission detail:\n%s", output)
 	}
 }
@@ -1388,8 +1388,10 @@ func TestServeRejectsUnsafeNoAuthOnRemote(t *testing.T) {
 }
 
 func TestServeRejectsWeakToken(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+
 	var out, errOut bytes.Buffer
-	code := Run([]string{"--store", filepath.Join(t.TempDir(), "once.db"), "serve", "--token", "short"}, &out, &errOut)
+	code := Run([]string{"--store", storePath, "serve", "--token", "short"}, &out, &errOut)
 	if code != 2 {
 		t.Fatalf("code = %d", code)
 	}
@@ -1398,6 +1400,27 @@ func TestServeRejectsWeakToken(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "at least 32 characters") {
 		t.Fatalf("stderr = %q", errOut.String())
+	}
+	if _, err := os.Stat(storePath); !os.IsNotExist(err) {
+		t.Fatalf("store stat err = %v, want not exist", err)
+	}
+}
+
+func TestServeDoesNotCreateTokenFileWhenStorePathIsInvalid(t *testing.T) {
+	dir := t.TempDir()
+	storePath := filepath.Join(dir, "once.db?mode=memory")
+	tokenFile := filepath.Join(dir, "once.token")
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "serve", "--token-file", tokenFile}, &out, &errOut)
+	if code != 1 {
+		t.Fatalf("code = %d stderr = %s", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "local filesystem path") {
+		t.Fatalf("stderr = %q", errOut.String())
+	}
+	if _, err := os.Stat(tokenFile); !os.IsNotExist(err) {
+		t.Fatalf("token file stat err = %v, want not exist", err)
 	}
 }
 

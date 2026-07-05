@@ -38,6 +38,9 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 			return nil, err
 		}
 	}
+	if err := RejectSharedWritableParent(path); err != nil {
+		return nil, err
+	}
 	if err := RejectSymlinkPath(path); err != nil {
 		return nil, err
 	}
@@ -203,7 +206,7 @@ WHERE key = ? AND state = 'running' AND attempt_hash = ?
 		return Record{}, err
 	}
 	if affected == 0 {
-		rec, err := s.Get(key)
+		rec, err := s.getWithAttemptHash(key)
 		if errors.Is(err, ErrNotFound) {
 			return Record{}, ErrNotFound
 		}
@@ -214,7 +217,7 @@ WHERE key = ? AND state = 'running' AND attempt_hash = ?
 			return Record{}, ErrConflict
 		}
 		if rec.Attempt == attemptHash && sameResult(rec, state, exitCode, stdout, stderr, runErr) {
-			rec.Attempt = attempt
+			rec.Attempt = ""
 			return rec, nil
 		}
 		return Record{}, ErrConflict
@@ -224,6 +227,19 @@ WHERE key = ? AND state = 'running' AND attempt_hash = ?
 }
 
 func (s *SQLiteStore) Get(key string) (Record, error) {
+	if err := ValidateKey(key); err != nil {
+		return Record{}, err
+	}
+
+	rec, err := s.getWithAttemptHash(key)
+	if err != nil {
+		return Record{}, err
+	}
+	rec.Attempt = ""
+	return rec, nil
+}
+
+func (s *SQLiteStore) getWithAttemptHash(key string) (Record, error) {
 	row := s.db.QueryRow(`
 SELECT key, attempt_hash, state, exit_code, stdout, stderr, error, command, started_at, finished_at, updated_at
 FROM once_records
@@ -281,6 +297,7 @@ FROM once_records
 		if err != nil {
 			return nil, err
 		}
+		rec.Attempt = ""
 		records = append(records, rec)
 	}
 	if err := rows.Err(); err != nil {
@@ -333,6 +350,7 @@ ORDER BY `+updatedAtExpr+` ASC, key ASC
 			_ = rows.Close()
 			return nil, err
 		}
+		rec.Attempt = ""
 		records = append(records, rec)
 	}
 	if err := rows.Close(); err != nil {
@@ -415,7 +433,7 @@ func (s *SQLiteStore) Forget(key string, force bool, attempt string) (bool, erro
 		if affected != 0 {
 			return true, nil
 		}
-		rec, err := s.Get(key)
+		rec, err := s.getWithAttemptHash(key)
 		if errors.Is(err, ErrNotFound) {
 			return false, nil
 		}

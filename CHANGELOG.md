@@ -9,6 +9,7 @@ User-facing changes are recorded here as releases are prepared.
 - Cookbook examples for webhook delivery, notification commands, HTTP reserve
   and commit, and stuck `running` record repair.
 - Checksummed Linux, macOS, and Windows release archives.
+- GitHub provenance attestations for release artifacts.
 
 ### Changed
 
@@ -17,6 +18,17 @@ User-facing changes are recorded here as releases are prepared.
   outbox tables, provider idempotency keys, and workflow engines.
 - The demo script now invokes its helper scripts through `sh` for better
   portability.
+- Quick start now includes installed CLI examples and PowerShell examples.
+- Release documentation now shows checksum and provenance verification.
+
+### Fixed
+
+- Store records no longer expose stored attempt hashes through returned record
+  values. Fresh reservations still return the raw attempt token that callers
+  need to commit or delete that reservation.
+- `serve --token` validation now fails before opening or creating the store.
+- SQLite stores and HTTP token files now reject Unix-like parent directories
+  that are writable by group or other users.
 
 ## v0.4.2 - 2026-07-03
 

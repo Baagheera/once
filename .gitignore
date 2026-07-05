@@ -25,6 +25,7 @@
 # Local build outputs.
 /once
 /once.exe
+/dist
 
 # OS/editor noise.
 .DS_Store

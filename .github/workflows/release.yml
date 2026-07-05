@@ -2,7 +2,7 @@ name: release
 
 on:
   release:
-    types: [created]
+    types: [published]
   workflow_dispatch:
     inputs:
       tag:
@@ -12,10 +12,18 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: build-artifacts
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
 
@@ -33,11 +41,12 @@ jobs:
         shell: bash
         env:
           DISPATCH_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             tag="$DISPATCH_TAG"
-          elif [ "${{ github.event_name }}" = "release" ]; then
-            tag="${{ github.event.release.tag_name }}"
+          elif [ "$GITHUB_EVENT_NAME" = "release" ]; then
+            tag="$RELEASE_TAG"
           else
             echo "unsupported event" >&2
             exit 1
@@ -46,12 +55,26 @@ jobs:
             echo "release tag must look like v0.5.0" >&2
             exit 1
           fi
-          git show-ref --verify --quiet "refs/tags/$tag"
+          git fetch --force origin main:refs/remotes/origin/main
+          if ! tag_commit="$(git rev-parse -q --verify "refs/tags/$tag^{commit}")"; then
+            echo "release tag does not exist: $tag" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
+            echo "release tag must point to a commit reachable from origin/main" >&2
+            exit 1
+          fi
           printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
       - name: Check out tag
         run: git checkout --detach "${{ steps.tag.outputs.tag }}"
       - name: Build artifacts
         run: python scripts/build_release_artifacts.py "${{ steps.tag.outputs.tag }}"
+      - name: Verify artifacts
+        run: python scripts/verify_release_artifacts.py "${{ steps.tag.outputs.tag }}"
+      - name: Generate artifact attestations
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/*
       - name: Upload artifact bundle
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -78,4 +101,4 @@ jobs:
         shell: bash
         run: |
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
-          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY"
+          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber

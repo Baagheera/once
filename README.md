@@ -66,6 +66,26 @@ For concrete recipes, see [`docs/cookbook.md`](docs/cookbook.md).
 go install github.com/Baagheera/once/cmd/once@latest
 ```
 
+Try it:
+
+```sh
+tmp="$(mktemp -d)"
+once --store "$tmp/once.db" run --key demo -- sh -c 'echo hello'
+once --store "$tmp/once.db" run --key demo -- sh -c 'echo hello'
+once --store "$tmp/once.db" list
+```
+
+Both runs print `hello`, but the command only runs the first time.
+
+On Windows PowerShell:
+
+```powershell
+$tmp = New-Item -ItemType Directory -Path ([System.IO.Path]::GetTempPath()) -Name ("once-" + [guid]::NewGuid())
+once --store "$tmp\once.db" run --key demo -- powershell -NoProfile -Command "Write-Output 'hello'"
+once --store "$tmp\once.db" run --key demo -- powershell -NoProfile -Command "Write-Output 'hello'"
+once --store "$tmp\once.db" list
+```
+
 For local development:
 
 ```sh
@@ -94,6 +114,27 @@ once --store "$HOME/.local/state/myapp/once.db" run --key payment:order-123 -- .
 Put the store in a directory owned by the app or by the user running it. Avoid
 shared temporary directories for real side effects; the database, WAL/SHM
 sidecars, and token file are all sensitive local files.
+
+## Release verification
+
+Release archives are attached to GitHub releases. After downloading one archive
+and `SHA256SUMS`, verify that archive's checksum:
+
+```sh
+archive=once_vX.Y.Z_linux_amd64.tar.gz
+grep "  $archive$" SHA256SUMS | sha256sum -c -
+```
+
+If you download every archive listed in `SHA256SUMS`, `sha256sum -c
+SHA256SUMS` verifies the full set.
+
+Release artifacts also include GitHub provenance attestations:
+
+```sh
+gh attestation verify once_vX.Y.Z_linux_amd64.tar.gz \
+  --repo Baagheera/once \
+  --signer-workflow Baagheera/once/.github/workflows/release.yml
+```
 
 ## Common patterns
 
@@ -359,6 +400,10 @@ Deleting over HTTP requires the reservation token in `X-Once-Attempt-Token`.
 Deleting a `running` record also requires `?force=1`. The local CLI keeps
 `forget --force` as an explicit administrative repair path for people with
 direct access to the SQLite database.
+
+If the delete token is missing or malformed, the API returns `400`. If the
+token is well formed but does not match the record, the API returns `404`, the
+same response used for a missing key.
 
 Do not expose `once serve` to untrusted networks. Non-loopback listeners require
 `--allow-remote`, and bearer authentication is still required unless auth is
