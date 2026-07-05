@@ -201,6 +201,51 @@ func TestUnauthorizedRequestsAreRejected(t *testing.T) {
 	}
 }
 
+func TestHealthDoesNotRequireAuth(t *testing.T) {
+	store, err := once.OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	handler := NewHandler(store, Options{AuthToken: "secret"})
+
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+}
+
+func TestWrongBearerTokenIsRejected(t *testing.T) {
+	store, err := once.OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	handler := NewHandler(store, Options{AuthToken: "secret"})
+
+	req := httptest.NewRequest("GET", "/v1/records/demo", nil)
+	req.Header.Set("Authorization", "Bearer wrong")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+}
+
+func TestRejectsMissingContentType(t *testing.T) {
+	handler := newTestHandler(t)
+
+	req := httptest.NewRequest("POST", "/v1/reserve", strings.NewReader(`{"key":"demo"}`))
+	req.Header.Set("Authorization", "Bearer test-token")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+}
+
 func TestRejectsTrailingJSON(t *testing.T) {
 	handler := newTestHandler(t)
 
@@ -222,6 +267,46 @@ func TestRejectsInvalidJSONGenerically(t *testing.T) {
 	}
 	if strings.Contains(res.Body.String(), "cannot unmarshal") {
 		t.Fatalf("body leaked decoder details: %s", res.Body.String())
+	}
+}
+
+func TestRejectsUnknownJSONFields(t *testing.T) {
+	handler := newTestHandler(t)
+
+	res := request(t, handler, "POST", "/v1/reserve", `{"key":"demo","extra":true}`)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+	if !strings.Contains(res.Body.String(), `"invalid json"`) {
+		t.Fatalf("body = %s", res.Body.String())
+	}
+	if strings.Contains(res.Body.String(), "unknown field") {
+		t.Fatalf("body leaked decoder details: %s", res.Body.String())
+	}
+}
+
+func TestRejectsOversizedJSONBody(t *testing.T) {
+	handler := newTestHandler(t)
+
+	body := `{"key":"` + strings.Repeat("a", 1<<20) + `"}`
+	res := request(t, handler, "POST", "/v1/reserve", body)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+	if !strings.Contains(res.Body.String(), `"invalid json"`) {
+		t.Fatalf("body = %s", res.Body.String())
+	}
+}
+
+func TestRejectsMalformedBase64Output(t *testing.T) {
+	handler := newTestHandler(t)
+
+	res := request(t, handler, "POST", "/v1/commit", `{"key":"demo","attempt_token":"not-secret-enough","state":"succeeded","exit_code":0,"stdout_b64":"%"}`)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+	if !strings.Contains(res.Body.String(), `"invalid json"`) {
+		t.Fatalf("body = %s", res.Body.String())
 	}
 }
 

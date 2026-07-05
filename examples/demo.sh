@@ -13,6 +13,8 @@ old_path="$PATH"
 cleanup() {
 	if [ -n "$server_pid" ]; then
 		kill "$server_pid" 2>/dev/null || true
+		wait "$server_pid" 2>/dev/null || true
+		server_pid=""
 	fi
 	PATH="$old_path"
 	rm -rf "$tmp"
@@ -64,20 +66,20 @@ printf 'once: a small idempotency log for side effects\n'
 
 printf '\n# without once\n'
 export ONCE_DEMO_LOG="$log"
-prompt "send-webhook event-123"
-send-webhook event-123
-prompt "send-webhook event-123"
-send-webhook event-123
+prompt "sh send-webhook event-123"
+sh "$tmp/send-webhook" event-123
+prompt "sh send-webhook event-123"
+sh "$tmp/send-webhook" event-123
 unset ONCE_DEMO_LOG
 printf 'side effects written: %s\n' "$(count_lines "$log")"
 
 printf '\n# with once\n'
 rm -f "$log"
 export ONCE_DEMO_LOG="$log"
-prompt "once run --key webhook:event-123 -- send-webhook event-123"
-"$once_bin" --store "$db" run --key webhook:event-123 -- send-webhook event-123
-prompt "once run --key webhook:event-123 -- send-webhook event-123"
-"$once_bin" --store "$db" run --key webhook:event-123 -- send-webhook event-123
+prompt "once run --key webhook:event-123 -- sh send-webhook event-123"
+"$once_bin" --store "$db" run --key webhook:event-123 -- sh "$tmp/send-webhook" event-123
+prompt "once run --key webhook:event-123 -- sh send-webhook event-123"
+"$once_bin" --store "$db" run --key webhook:event-123 -- sh "$tmp/send-webhook" event-123
 unset ONCE_DEMO_LOG
 printf 'side effects written: %s\n' "$(count_lines "$log")"
 prompt "once status webhook:event-123"
@@ -85,15 +87,15 @@ prompt "once status webhook:event-123"
 
 printf '\n# failed results are replayed too\n'
 export ONCE_DEMO_FAIL_LOG="$fail_log"
-prompt "once run --key charge:order-42 -- charge order-42"
+prompt "once run --key charge:order-42 -- sh charge order-42"
 set +e
-"$once_bin" --store "$fail_db" run --key charge:order-42 -- charge order-42
+"$once_bin" --store "$fail_db" run --key charge:order-42 -- sh "$tmp/charge" order-42
 code1=$?
 set -e
 printf 'exit code: %s\n' "$code1"
-prompt "once run --key charge:order-42 -- charge order-42"
+prompt "once run --key charge:order-42 -- sh charge order-42"
 set +e
-"$once_bin" --store "$fail_db" run --key charge:order-42 -- charge order-42
+"$once_bin" --store "$fail_db" run --key charge:order-42 -- sh "$tmp/charge" order-42
 code2=$?
 set -e
 unset ONCE_DEMO_FAIL_LOG

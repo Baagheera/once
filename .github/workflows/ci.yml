@@ -30,6 +30,8 @@ jobs:
       - run: go run golang.org/x/vuln/cmd/govulncheck@v1.5.0 ./...
       - run: go build ./cmd/once
       - if: matrix.os == 'ubuntu-latest'
+        run: python scripts/build_release_artifacts.py ci-test
+      - if: matrix.os == 'ubuntu-latest'
         run: sh examples/demo.sh
 
   minimum-go:

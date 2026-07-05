@@ -4,7 +4,19 @@ User-facing changes are recorded here as releases are prepared.
 
 ## Unreleased
 
-No unreleased changes.
+### Added
+
+- Cookbook examples for webhook delivery, notification commands, HTTP reserve
+  and commit, and stuck `running` record repair.
+- Checksummed Linux, macOS, and Windows release archives.
+
+### Changed
+
+- README now shows the retry-safe side-effect model earlier, including the
+  exactly-once limitation, key guidance, and comparisons with locks, queues,
+  outbox tables, provider idempotency keys, and workflow engines.
+- The demo script now invokes its helper scripts through `sh` for better
+  portability.
 
 ## v0.4.2 - 2026-07-03
 
