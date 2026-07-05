@@ -364,6 +364,29 @@ func TestDeleteFinishedRequiresAttempt(t *testing.T) {
 	}
 }
 
+func TestDeleteWithWrongAttemptReturnsNotFound(t *testing.T) {
+	handler := newTestHandler(t)
+
+	res := request(t, handler, "POST", "/v1/reserve", `{"key":"demo","command":["send","email"]}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("reserve status = %d body = %s", res.Code, res.Body.String())
+	}
+	attempt := jsonString(t, res.Body.Bytes(), "attempt_token")
+	res = request(t, handler, "POST", "/v1/commit", `{"key":"demo","attempt_token":"`+attempt+`","state":"succeeded","exit_code":0}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("commit status = %d body = %s", res.Code, res.Body.String())
+	}
+
+	wrongAttempt, err := once.NewAttemptToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	res = requestWithAttempt(t, handler, "DELETE", "/v1/records/demo", "", wrongAttempt)
+	if res.Code != http.StatusNotFound {
+		t.Fatalf("delete with wrong attempt status = %d body = %s", res.Code, res.Body.String())
+	}
+}
+
 func newTestHandler(t *testing.T) http.Handler {
 	t.Helper()
 

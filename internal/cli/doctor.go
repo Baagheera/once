@@ -165,6 +165,9 @@ func doctorCheckParent(path string) doctorCheck {
 	if err := once.RejectSymlinkPath(dir); err != nil {
 		return doctorCheck{name: "store parent", level: doctorFail, detail: err.Error()}
 	}
+	if err := once.RejectSharedWritableParent(path); err != nil {
+		return doctorCheck{name: "store parent", level: doctorFail, detail: err.Error()}
+	}
 
 	info, err := os.Stat(dir)
 	if err == nil {

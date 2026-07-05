@@ -29,6 +29,10 @@ func RestrictLocalFile(path string) error {
 	return restrictLocalFile(path)
 }
 
+func RejectSharedWritableParent(path string) error {
+	return rejectSharedWritableParent(path)
+}
+
 func pathPrefixes(path string) []string {
 	clean := filepath.Clean(path)
 	volume := filepath.VolumeName(clean)

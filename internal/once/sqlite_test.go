@@ -123,6 +123,39 @@ func TestCommitIsIdempotentForSameResult(t *testing.T) {
 	}
 }
 
+func TestCommitDoesNotReturnStoredAttemptHash(t *testing.T) {
+	store, err := OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	rec, _, err := store.Reserve("k1", []string{"echo", "one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := rec.Attempt
+	if attempt == "" {
+		t.Fatal("fresh reservation should return attempt token")
+	}
+
+	rec, err = store.Commit("k1", attempt, Succeeded, 0, []byte("one\n"), nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Attempt != "" {
+		t.Fatalf("committed record attempt = %q, want empty", rec.Attempt)
+	}
+
+	rec, err = store.Commit("k1", attempt, Succeeded, 0, []byte("one\n"), nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Attempt != "" {
+		t.Fatalf("idempotent commit attempt = %q, want empty", rec.Attempt)
+	}
+}
+
 func TestCommitConflictsForDifferentResult(t *testing.T) {
 	store, err := OpenSQLite(t.TempDir() + "/once.db")
 	if err != nil {
@@ -162,6 +195,18 @@ func TestCommitRejectsWrongAttempt(t *testing.T) {
 	}
 	if _, err := store.Commit("k1", wrongAttempt, Succeeded, 0, []byte("one\n"), nil, ""); err != ErrConflict {
 		t.Fatalf("Commit err = %v, want ErrConflict", err)
+	}
+}
+
+func TestGetRejectsInvalidKey(t *testing.T) {
+	store, err := OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if _, err := store.Get("bad/key"); err == nil || err == ErrNotFound {
+		t.Fatalf("Get err = %v, want validation error", err)
 	}
 }
 

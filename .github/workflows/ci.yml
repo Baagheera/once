@@ -27,10 +27,13 @@ jobs:
         run: go run github.com/zricethezav/gitleaks/v8@v8.30.1 detect --source . --no-git --redact --exit-code 1
       - run: go test ./...
       - run: go vet ./...
+      - run: go mod verify
       - run: go run golang.org/x/vuln/cmd/govulncheck@v1.5.0 ./...
       - run: go build ./cmd/once
       - if: matrix.os == 'ubuntu-latest'
         run: python scripts/build_release_artifacts.py ci-test
+      - if: matrix.os == 'ubuntu-latest'
+        run: python scripts/verify_release_artifacts.py ci-test
       - if: matrix.os == 'ubuntu-latest'
         run: sh examples/demo.sh
 
@@ -46,4 +49,5 @@ jobs:
           cache: true
       - run: go test ./...
       - run: go vet ./...
+      - run: go mod verify
       - run: go build ./cmd/once
