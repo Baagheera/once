@@ -27,6 +27,42 @@ counts toward that limit.
 Keys are exact identifiers. The server does not trim or normalize them. Use
 ASCII letters, digits, `.`, `_`, `:`, `@`, `=`, and `-`, up to 256 bytes.
 
+## Go client
+
+Go programs can use `github.com/Baagheera/once/oncehttp` for the same reserve,
+commit, get, and delete calls:
+
+```go
+client, err := oncehttp.New("http://127.0.0.1:7410", oncehttp.WithBearerToken(token))
+if err != nil {
+	return err
+}
+
+reserved, err := client.Reserve(ctx, oncehttp.ReserveRequest{
+	Key:     "webhook:event-123",
+	Command: []string{"deliver-webhook", "event-123"},
+})
+if err != nil {
+	return err
+}
+if !reserved.Fresh {
+	return replay(reserved.Record)
+}
+
+_, err = client.Commit(ctx, oncehttp.CommitRequest{
+	Key:          reserved.Record.Key,
+	AttemptToken: reserved.AttemptToken,
+	State:        oncehttp.Succeeded,
+	ExitCode:     0,
+	Stdout:       []byte("ok\n"),
+})
+return err
+```
+
+The client is a wrapper around the HTTP API. It does not execute commands or
+open the SQLite store directly. It caps successful JSON responses at 16 MiB by
+default; use `oncehttp.WithMaxResponseBytes` for larger stored output.
+
 ## Endpoints
 
 | Method | Path | Purpose |

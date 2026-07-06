@@ -354,6 +354,114 @@ VALUES ('legacy', 'running', '["old"]', ?, ?);
 	if rec.State != Running || len(rec.Command) != 1 || rec.Command[0] != "old" {
 		t.Fatalf("legacy record = %#v", rec)
 	}
+
+	var version string
+	if err := store.db.QueryRow(`SELECT value FROM once_meta WHERE key = 'schema_version'`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != sqliteSchemaVersion {
+		t.Fatalf("schema version = %q, want %q", version, sqliteSchemaVersion)
+	}
+}
+
+func TestOpenSQLiteInitializesSchemaVersion(t *testing.T) {
+	store, err := OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var version string
+	if err := store.db.QueryRow(`SELECT value FROM once_meta WHERE key = 'schema_version'`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != sqliteSchemaVersion {
+		t.Fatalf("schema version = %q, want %q", version, sqliteSchemaVersion)
+	}
+}
+
+func TestOpenSQLiteRejectsNewerSchemaVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "once.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+CREATE TABLE once_meta (
+	key TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+);
+INSERT INTO once_meta (key, value) VALUES ('schema_version', '999');
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := RestrictLocalFile(path); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := OpenSQLite(path)
+	if err == nil {
+		_ = store.Close()
+		t.Fatal("OpenSQLite succeeded, want newer schema error")
+	}
+	if !strings.Contains(err.Error(), "newer sqlite schema") {
+		t.Fatalf("err = %v", err)
+	}
+
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var recordTableCount int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'once_records'`).Scan(&recordTableCount); err != nil {
+		t.Fatal(err)
+	}
+	if recordTableCount != 0 {
+		t.Fatalf("once_records table count = %d, want 0", recordTableCount)
+	}
+	for _, sidecar := range []string{path + "-wal", path + "-shm"} {
+		if _, err := os.Stat(sidecar); !os.IsNotExist(err) {
+			t.Fatalf("sidecar %s exists or stat failed: %v", sidecar, err)
+		}
+	}
+}
+
+func TestOpenSQLiteRejectsOlderSchemaVersionWithoutMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "once.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+CREATE TABLE once_meta (
+	key TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+);
+INSERT INTO once_meta (key, value) VALUES ('schema_version', '0');
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := RestrictLocalFile(path); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := OpenSQLite(path)
+	if err == nil {
+		_ = store.Close()
+		t.Fatal("OpenSQLite succeeded, want older schema error")
+	}
+	if !strings.Contains(err.Error(), "older sqlite schema") {
+		t.Fatalf("err = %v", err)
+	}
 }
 
 func TestConcurrentReserveOnlyOneFresh(t *testing.T) {

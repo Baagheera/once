@@ -4,6 +4,13 @@ User-facing changes are recorded here as releases are prepared.
 
 ## Unreleased
 
+### Added
+
+- `oncehttp` Go package for calling the HTTP reserve, commit, get, and delete
+  endpoints without hand-writing JSON requests.
+- SQLite schema metadata so once can mark the current store schema and reject
+  stores that declare an unsupported schema version.
+
 ## v0.5.0 - 2026-07-06
 
 ### Added
