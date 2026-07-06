@@ -275,9 +275,17 @@ SELECT key, attempt_hash, state, exit_code, ` + outputColumns + `, error, comman
 FROM once_records
 `
 	var args []any
+	var filters []string
 	if opts.State != "" {
-		query += "WHERE state = ?\n"
+		filters = append(filters, "state = ?")
 		args = append(args, string(opts.State))
+	}
+	if !opts.UpdatedBefore.IsZero() {
+		filters = append(filters, updatedAtExpr+" < ?")
+		args = append(args, formatSortableTime(opts.UpdatedBefore))
+	}
+	if len(filters) > 0 {
+		query += "WHERE " + strings.Join(filters, " AND ") + "\n"
 	}
 	query += "ORDER BY " + updatedAtExpr + " DESC, key ASC\n"
 	if opts.Limit > 0 {

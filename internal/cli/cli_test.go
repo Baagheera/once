@@ -1062,6 +1062,52 @@ func TestExportJSONLRedactsOutputByDefault(t *testing.T) {
 	}
 }
 
+func TestListAndExportFilterOlderThan(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Reserve("old-running", []string{"send", "email"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Reserve("new-running", []string{"send", "sms"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	oldTime := time.Now().UTC().Add(-2 * time.Hour)
+	newTime := time.Now().UTC()
+	setRecordUpdatedAt(t, storePath, "old-running", oldTime)
+	setRecordUpdatedAt(t, storePath, "new-running", newTime)
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "list", "--state", "running", "--older-than", "1h"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("list code = %d stderr = %s", code, errOut.String())
+	}
+	listed := out.String()
+	if !strings.Contains(listed, "old-running") {
+		t.Fatalf("list output missing old record:\n%s", listed)
+	}
+	if strings.Contains(listed, "new-running") {
+		t.Fatalf("list output included new record:\n%s", listed)
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"--store", storePath, "export", "--state", "running", "--older-than", "1h"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("export code = %d stderr = %s", code, errOut.String())
+	}
+	docs := decodeExport(t, out.String())
+	if len(docs) != 1 || docs[0]["key"] != "old-running" {
+		t.Fatalf("export docs = %#v", docs)
+	}
+}
+
 func TestGetRedactsOutputByDefault(t *testing.T) {
 	t.Setenv("ONCE_TEST_HELPER", "1")
 
@@ -1213,6 +1259,16 @@ func TestListAndExportRejectInvalidFilters(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "--limit") {
 		t.Fatalf("export stderr = %q", errOut.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"--store", storePath, "list", "--older-than", "0d"}, &out, &errOut)
+	if code != 2 {
+		t.Fatalf("list older-than code = %d", code)
+	}
+	if !strings.Contains(errOut.String(), "--older-than") {
+		t.Fatalf("list older-than stderr = %q", errOut.String())
 	}
 }
 
@@ -1482,6 +1538,28 @@ func TestResolveAuthTokenRejectsSymlinkAncestor(t *testing.T) {
 	tokenFile := filepath.Join(link, "sub", "once.token")
 	if _, _, err := resolveAuthToken("", tokenFile, false, filepath.Join(dir, "once.db")); err == nil {
 		t.Fatal("expected symlink ancestor to be rejected")
+	}
+}
+
+func setRecordUpdatedAt(t *testing.T, storePath, key string, updatedAt time.Time) {
+	t.Helper()
+
+	db, err := sql.Open("sqlite", storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	res, err := db.Exec(`UPDATE once_records SET updated_at = ? WHERE key = ?`, updatedAt.UTC().Format(time.RFC3339Nano), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if affected != 1 {
+		t.Fatalf("updated %d records for key %q, want 1", affected, key)
 	}
 }
 

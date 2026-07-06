@@ -28,6 +28,7 @@ type ListOptions struct {
 	State         State
 	Limit         int
 	IncludeOutput bool
+	UpdatedBefore time.Time
 }
 
 type PruneOptions struct {
