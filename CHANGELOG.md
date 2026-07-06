@@ -4,6 +4,8 @@ User-facing changes are recorded here as releases are prepared.
 
 ## Unreleased
 
+## v0.5.0 - 2026-07-06
+
 ### Added
 
 - Cookbook examples for webhook delivery, notification commands, HTTP reserve
