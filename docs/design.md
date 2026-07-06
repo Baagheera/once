@@ -29,6 +29,18 @@ the row is committed. once does not guess. The row remains `running`.
 This makes uncertainty visible. Callers can inspect the key and decide whether
 to reconcile externally, forget the key, or leave it alone.
 
+## Public surfaces
+
+The intended public surfaces are the CLI and HTTP API.
+
+The Go packages are internal today. That keeps the project free to adjust
+storage and package boundaries before `v1.0.0` without pretending there is a
+stable library API.
+
+The SQLite file is the durable store, but the schema is not a separately stable
+integration contract before `v1.0.0`. Existing stores should be migrated when
+the project carries a migration path.
+
 ## HTTP server
 
 `once serve` exposes the ledger over HTTP for programs that cannot or should not

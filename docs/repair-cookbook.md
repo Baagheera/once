@@ -16,11 +16,20 @@ List records that are still in flight:
 once list --state running
 ```
 
+To focus on records that have been uncertain for a while, filter by update
+time:
+
+```sh
+once list --state running --older-than 15m
+once list --state running --older-than 1h
+```
+
 For local scripts or a controlled audit capture, export the same records as
 JSONL:
 
 ```sh
 once export --state running
+once export --state running --older-than 1h
 ```
 
 `export` includes keys, command arguments, errors, and timestamps. Treat the
@@ -33,7 +42,7 @@ move.
 If you are not using the default `once.db`, pass the store explicitly:
 
 ```sh
-once --store /var/lib/myapp/once.db list --state running
+once --store /var/lib/myapp/once.db list --state running --older-than 15m
 ```
 
 ## Inspect one key

@@ -158,7 +158,9 @@ Use the smallest repair that matches what you know:
 
 ```sh
 once list --state running
+once list --state running --older-than 15m
 once export --state running
+once export --state running --older-than 1h
 once status KEY
 once get KEY
 once prune --state succeeded --older-than 30d

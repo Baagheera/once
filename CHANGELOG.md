@@ -10,12 +10,18 @@ User-facing changes are recorded here as releases are prepared.
   and commit, and stuck `running` record repair.
 - Checksummed Linux, macOS, and Windows release archives.
 - GitHub provenance attestations for release artifacts.
+- `list --older-than DURATION` and `export --older-than DURATION` for finding
+  stale records, especially old `running` records.
+- README exit-code reference and stability notes for the CLI, HTTP API, Go
+  packages, and SQLite schema.
 
 ### Changed
 
 - README now shows the retry-safe side-effect model earlier, including the
   exactly-once limitation, key guidance, and comparisons with locks, queues,
   outbox tables, provider idempotency keys, and workflow engines.
+- README now includes a table of contents and a more compact command-focused
+  structure.
 - The demo script now invokes its helper scripts through `sh` for better
   portability.
 - Quick start now includes installed CLI examples and PowerShell examples.

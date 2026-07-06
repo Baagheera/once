@@ -296,6 +296,66 @@ func TestForceForgetRejectsWrongAttempt(t *testing.T) {
 	}
 }
 
+func TestOpenSQLiteMigratesMissingAttemptHash(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "once.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := db.Exec(`
+CREATE TABLE once_records (
+	key TEXT PRIMARY KEY,
+	state TEXT NOT NULL CHECK (state IN ('running', 'succeeded', 'failed')),
+	exit_code INTEGER NOT NULL DEFAULT 0,
+	stdout BLOB NOT NULL DEFAULT X'',
+	stderr BLOB NOT NULL DEFAULT X'',
+	error TEXT NOT NULL DEFAULT '',
+	command TEXT NOT NULL DEFAULT '[]',
+	started_at TEXT NOT NULL,
+	finished_at TEXT,
+	updated_at TEXT NOT NULL
+);
+CREATE INDEX once_records_state_idx ON once_records(state);
+INSERT INTO once_records (key, state, command, started_at, updated_at)
+VALUES ('legacy', 'running', '["old"]', ?, ?);
+`, formatTime(now), formatTime(now)); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := RestrictLocalFile(path); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var columnCount int
+	if err := store.db.QueryRow(`SELECT count(*) FROM pragma_table_info('once_records') WHERE name = 'attempt_hash'`).Scan(&columnCount); err != nil {
+		t.Fatal(err)
+	}
+	if columnCount != 1 {
+		t.Fatalf("attempt_hash column count = %d, want 1", columnCount)
+	}
+
+	rec, err := store.Get("legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Attempt != "" {
+		t.Fatalf("legacy attempt = %q, want empty", rec.Attempt)
+	}
+	if rec.State != Running || len(rec.Command) != 1 || rec.Command[0] != "old" {
+		t.Fatalf("legacy record = %#v", rec)
+	}
+}
+
 func TestConcurrentReserveOnlyOneFresh(t *testing.T) {
 	store, err := OpenSQLite(t.TempDir() + "/once.db")
 	if err != nil {
@@ -474,6 +534,43 @@ VALUES (?, ?, 'running', '[]', ?, ?)
 	want := []string{"same-a", "same-b", "newer", "older"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("order = %v, want %v", got, want)
+	}
+}
+
+func TestListFiltersByUpdatedBefore(t *testing.T) {
+	store, err := OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-48 * time.Hour)
+	recent := now.Add(-2 * time.Hour)
+	cutoff := now.Add(-24 * time.Hour)
+	for _, row := range []struct {
+		key string
+		at  time.Time
+	}{
+		{key: "old-running", at: old},
+		{key: "recent-running", at: recent},
+	} {
+		if _, err := store.db.Exec(`
+INSERT INTO once_records (key, attempt_hash, state, command, started_at, updated_at)
+VALUES (?, ?, 'running', '[]', ?, ?)
+`, row.key, row.key+"-attempt", formatTime(row.at), formatTime(row.at)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	records, err := store.List(ListOptions{State: Running, UpdatedBefore: cutoff})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := recordKeys(records)
+	want := []string{"old-running"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("records = %v, want %v", got, want)
 	}
 }
 

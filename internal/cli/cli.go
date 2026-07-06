@@ -269,6 +269,7 @@ func listCommand(args []string, storePath string, stdout, stderr io.Writer) int 
 	fs.SetOutput(stderr)
 	stateFlag := fs.String("state", "", "filter by state: running, succeeded, or failed")
 	limitFlag := fs.Int("limit", 0, "maximum records to print; 0 means all")
+	olderThanFlag := fs.String("older-than", "", "filter records updated more than this duration ago")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -277,7 +278,7 @@ func listCommand(args []string, storePath string, stdout, stderr io.Writer) int 
 		return 2
 	}
 
-	opts, ok := listOptions(*stateFlag, *limitFlag, stderr)
+	opts, ok := listOptions(*stateFlag, *limitFlag, *olderThanFlag, time.Now().UTC(), stderr)
 	if !ok {
 		return 2
 	}
@@ -309,6 +310,7 @@ func exportCommand(args []string, storePath string, stdout, stderr io.Writer) in
 	fs.SetOutput(stderr)
 	stateFlag := fs.String("state", "", "filter by state: running, succeeded, or failed")
 	limitFlag := fs.Int("limit", 0, "maximum records to export; 0 means all")
+	olderThanFlag := fs.String("older-than", "", "filter records updated more than this duration ago")
 	includeOutput := fs.Bool("include-output", false, "include stdout_b64 and stderr_b64")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -318,7 +320,7 @@ func exportCommand(args []string, storePath string, stdout, stderr io.Writer) in
 		return 2
 	}
 
-	opts, ok := listOptions(*stateFlag, *limitFlag, stderr)
+	opts, ok := listOptions(*stateFlag, *limitFlag, *olderThanFlag, time.Now().UTC(), stderr)
 	if !ok {
 		return 2
 	}
@@ -469,7 +471,7 @@ func listRecords(storePath string, opts once.ListOptions, stderr io.Writer) ([]o
 	return records, 0
 }
 
-func listOptions(state string, limit int, stderr io.Writer) (once.ListOptions, bool) {
+func listOptions(state string, limit int, olderThan string, now time.Time, stderr io.Writer) (once.ListOptions, bool) {
 	if limit < 0 {
 		fmt.Fprintln(stderr, "once: --limit must be non-negative")
 		return once.ListOptions{}, false
@@ -487,6 +489,14 @@ func listOptions(state string, limit int, stderr io.Writer) (once.ListOptions, b
 		fmt.Fprintln(stderr, "once: --state must be running, succeeded, or failed")
 		return once.ListOptions{}, false
 	}
+	if strings.TrimSpace(olderThan) != "" {
+		age, err := parseAgeDuration(olderThan)
+		if err != nil || age <= 0 {
+			fmt.Fprintln(stderr, "once: --older-than must be a positive duration")
+			return once.ListOptions{}, false
+		}
+		opts.UpdatedBefore = now.UTC().Add(-age)
+	}
 	return opts, true
 }
 
@@ -502,7 +512,7 @@ func pruneOptions(state string, olderThan string, force bool, now time.Time, std
 		return once.PruneOptions{}, false
 	}
 
-	age, err := parsePruneDuration(olderThan)
+	age, err := parseAgeDuration(olderThan)
 	if err != nil || age <= 0 {
 		fmt.Fprintln(stderr, "once: --older-than must be a positive duration")
 		return once.PruneOptions{}, false
@@ -511,7 +521,7 @@ func pruneOptions(state string, olderThan string, force bool, now time.Time, std
 	return opts, true
 }
 
-func parsePruneDuration(value string) (time.Duration, error) {
+func parseAgeDuration(value string) (time.Duration, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return 0, fmt.Errorf("empty duration")
@@ -872,8 +882,8 @@ func usage(w io.Writer) {
 		"  once [--store PATH] status KEY",
 		"  once [--store PATH] get [--include-output] KEY",
 		"  once [--store PATH] doctor [--json]",
-		"  once [--store PATH] list [--state STATE] [--limit N]",
-		"  once [--store PATH] export [--state STATE] [--limit N] [--include-output]",
+		"  once [--store PATH] list [--state STATE] [--limit N] [--older-than DURATION]",
+		"  once [--store PATH] export [--state STATE] [--limit N] [--older-than DURATION] [--include-output]",
 		"  once [--store PATH] prune --state STATE --older-than DURATION [--force]",
 		"  once [--store PATH] forget [--force] KEY",
 		"  once version",
