@@ -29,6 +29,7 @@ so the uncertainty is visible.
 - [Exit codes](#exit-codes)
 - [Inspect and repair](#inspect-and-repair)
 - [HTTP mode](#http-mode)
+- [Go HTTP client](#go-http-client)
 - [Security notes](#security-notes)
 - [Current limitations](#current-limitations)
 - [Why not](#why-not)
@@ -311,6 +312,48 @@ Deleting a `running` record also requires `?force=1`.
 
 For the full API, see [`docs/http-api.md`](docs/http-api.md).
 
+## Go HTTP client
+
+Go programs can use the small HTTP client package instead of hand-writing the
+JSON calls:
+
+```go
+client, err := oncehttp.New("http://127.0.0.1:7410", oncehttp.WithBearerToken(token))
+if err != nil {
+	return err
+}
+
+reserved, err := client.Reserve(ctx, oncehttp.ReserveRequest{
+	Key:     "webhook:event-123",
+	Command: []string{"deliver-webhook", "event-123"},
+})
+if err != nil {
+	return err
+}
+if !reserved.Fresh {
+	return replay(reserved.Record)
+}
+
+// Perform the side effect here, then commit the terminal result.
+_, err = client.Commit(ctx, oncehttp.CommitRequest{
+	Key:          "webhook:event-123",
+	AttemptToken: reserved.AttemptToken,
+	State:        oncehttp.Succeeded,
+	ExitCode:     0,
+	Stdout:       []byte("ok\n"),
+})
+return err
+```
+
+Import path:
+
+```go
+import "github.com/Baagheera/once/oncehttp"
+```
+
+The client caps successful JSON responses at 16 MiB by default. Use
+`oncehttp.WithMaxResponseBytes` if stored output can be larger.
+
 ## Security notes
 
 Treat the SQLite store as sensitive if command arguments, stdout, stderr, error
@@ -379,10 +422,11 @@ long-running state machine, use a workflow engine. once is deliberately smaller.
 
 once is experimental before `v1.0.0`.
 
-The intended public surfaces are the CLI and HTTP API. The Go packages are
-internal today, and the SQLite schema may still change before `v1.0.0`.
-Existing stores are migrated when the project carries a migration path, but the
-storage file is not yet a separately stable integration contract.
+The CLI and HTTP API are the main public surfaces. `oncehttp` is a small
+experimental wrapper around the HTTP API. Other Go packages are internal today.
+The SQLite schema may still change before `v1.0.0`; once records a schema
+version and rejects stores that declare an unsupported version, but the storage
+file is not yet a separately stable integration contract.
 
 ## Development
 

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +19,8 @@ import (
 type SQLiteStore struct {
 	db *sql.DB
 }
+
+const sqliteSchemaVersion = "1"
 
 func OpenSQLite(path string) (*SQLiteStore, error) {
 	if path == "" {
@@ -89,6 +92,10 @@ func (s *SQLiteStore) Close() error {
 }
 
 func (s *SQLiteStore) init() error {
+	if err := s.rejectUnsupportedSchemaVersion(); err != nil {
+		return err
+	}
+
 	pragmas := []string{
 		"PRAGMA journal_mode = WAL",
 		"PRAGMA busy_timeout = 5000",
@@ -120,7 +127,10 @@ CREATE INDEX IF NOT EXISTS once_records_state_idx ON once_records(state);
 	if err != nil {
 		return err
 	}
-	return s.ensureColumn("once_records", "attempt_hash", "ALTER TABLE once_records ADD COLUMN attempt_hash TEXT NOT NULL DEFAULT ''")
+	if err := s.ensureColumn("once_records", "attempt_hash", "ALTER TABLE once_records ADD COLUMN attempt_hash TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	return s.ensureSchemaVersion()
 }
 
 func (s *SQLiteStore) Reserve(key string, command []string) (Record, bool, error) {
@@ -637,6 +647,96 @@ func (s *SQLiteStore) ensureColumn(table, column, ddl string) error {
 	}
 	_, err = s.db.Exec(ddl)
 	return err
+}
+
+func (s *SQLiteStore) rejectUnsupportedSchemaVersion() error {
+	exists, err := s.tableExists("once_meta")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+
+	var version string
+	err = s.db.QueryRow(`SELECT value FROM once_meta WHERE key = 'schema_version'`).Scan(&version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	return CheckSQLiteSchemaVersion(version)
+}
+
+func (s *SQLiteStore) ensureSchemaVersion() error {
+	if _, err := s.db.Exec(`
+CREATE TABLE IF NOT EXISTS once_meta (
+	key TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+);
+`); err != nil {
+		return err
+	}
+
+	var version string
+	err := s.db.QueryRow(`SELECT value FROM once_meta WHERE key = 'schema_version'`).Scan(&version)
+	if errors.Is(err, sql.ErrNoRows) {
+		_, err = s.db.Exec(`INSERT INTO once_meta (key, value) VALUES ('schema_version', ?)`, sqliteSchemaVersion)
+		return err
+	}
+	if err != nil {
+		return err
+	}
+
+	if err := CheckSQLiteSchemaVersion(version); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *SQLiteStore) tableExists(name string) (bool, error) {
+	var count int
+	if err := s.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, name).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// CheckSQLiteSchemaVersion rejects stores that need a different once binary.
+func CheckSQLiteSchemaVersion(version string) error {
+	found, current, err := sqliteSchemaVersions(version)
+	if err != nil {
+		return err
+	}
+	if found > current {
+		return newerSQLiteSchemaError(version)
+	}
+	if found < current {
+		return olderSQLiteSchemaError(version)
+	}
+	return nil
+}
+
+func sqliteSchemaVersions(version string) (int, int, error) {
+	found, err := strconv.Atoi(version)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid sqlite schema version %q", version)
+	}
+	current, err := strconv.Atoi(sqliteSchemaVersion)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid current sqlite schema version %q", sqliteSchemaVersion)
+	}
+	return found, current, nil
+}
+
+func newerSQLiteSchemaError(version string) error {
+	return fmt.Errorf("newer sqlite schema version %s is not supported by this once binary", version)
+}
+
+func olderSQLiteSchemaError(version string) error {
+	return fmt.Errorf("older sqlite schema version %s requires a migration not available in this once binary", version)
 }
 
 func sameCommand(a, b []string) bool {

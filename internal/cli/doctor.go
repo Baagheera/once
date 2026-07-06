@@ -3,6 +3,7 @@ package cli
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -326,6 +327,10 @@ type sqliteColumn struct {
 }
 
 func doctorCheckSQLiteSchema(db *sql.DB) doctorCheck {
+	if err := doctorCheckSQLiteSchemaVersion(db); err != nil {
+		return doctorCheck{name: "sqlite schema", level: doctorFail, detail: err.Error()}
+	}
+
 	var tableCount int
 	if err := db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'once_records'").Scan(&tableCount); err != nil {
 		return doctorCheck{name: "sqlite schema", level: doctorFail, detail: err.Error()}
@@ -345,6 +350,26 @@ func doctorCheckSQLiteSchema(db *sql.DB) doctorCheck {
 		return doctorCheck{name: "sqlite schema", level: doctorFail, detail: err.Error()}
 	}
 	return doctorCheck{name: "sqlite schema", level: doctorOK, detail: "once_records table is readable"}
+}
+
+func doctorCheckSQLiteSchemaVersion(db *sql.DB) error {
+	var tableCount int
+	if err := db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'once_meta'").Scan(&tableCount); err != nil {
+		return err
+	}
+	if tableCount == 0 {
+		return nil
+	}
+
+	var version string
+	err := db.QueryRow(`SELECT value FROM once_meta WHERE key = 'schema_version'`).Scan(&version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return once.CheckSQLiteSchemaVersion(version)
 }
 
 func doctorSchemaProblem(columns map[string]sqliteColumn) string {
