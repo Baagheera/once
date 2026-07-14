@@ -2,6 +2,7 @@
 import hashlib
 import os
 import platform
+import re
 import stat
 import subprocess
 import sys
@@ -10,9 +11,12 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+from verify_workflow_toolchains import CURRENT_GO
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
+EXPECTED_GO_VERSION = f"go{CURRENT_GO}"
 TARGETS = (
     ("linux", "amd64", ".tar.gz", "once"),
     ("linux", "arm64", ".tar.gz", "once"),
@@ -97,6 +101,10 @@ def verify_tar(path: Path, binary: str) -> None:
                 raise RuntimeError(f"non-regular tar entry in {path.name}: {member.name}")
         if members[binary].mode & 0o111 == 0:
             raise RuntimeError(f"{binary} is not executable in {path.name}")
+        binary_file = tf.extractfile(members[binary])
+        if binary_file is None:
+            raise RuntimeError(f"cannot read {binary} from {path.name}")
+        verify_archive_binary(binary_file.read(), binary, path.name)
 
 
 def verify_zip(path: Path, binary: str) -> None:
@@ -112,6 +120,40 @@ def verify_zip(path: Path, binary: str) -> None:
             file_type = stat.S_IFMT(mode)
             if file_type not in (0, stat.S_IFREG):
                 raise RuntimeError(f"non-regular zip entry in {path.name}: {info.filename}")
+        verify_archive_binary(zf.read(binary), binary, path.name)
+
+
+def verify_archive_binary(contents: bytes, binary: str, archive: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="once-release-verify-") as tmp:
+        binary_path = Path(tmp) / binary
+        binary_path.write_bytes(contents)
+        result = subprocess.run(
+            ["go", "version", "-m", str(binary_path)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    if result.returncode != 0:
+        detail = (
+            result.stderr.strip()
+            or result.stdout.strip()
+            or f"exit code {result.returncode}"
+        )
+        raise RuntimeError(f"cannot read Go build metadata from {archive}: {detail}")
+    verify_go_metadata(result.stdout, archive)
+
+
+def verify_go_metadata(metadata: str, archive: str) -> None:
+    lines = metadata.splitlines()
+    first_line = lines[0] if lines else ""
+    _, separator, version = first_line.rpartition(": ")
+    version_pattern = r"go\d+\.\d+(?:\.\d+)?(?:beta\d+|rc\d+)?"
+    if not separator or not re.fullmatch(version_pattern, version):
+        raise RuntimeError(f"malformed Go build metadata in {archive}: {first_line!r}")
+    if version != EXPECTED_GO_VERSION:
+        raise RuntimeError(
+            f"{archive} embedded Go version = {version!r}, want {EXPECTED_GO_VERSION!r}"
+        )
 
 
 def reject_unsafe_archive_name(path: Path, name: str) -> None:
