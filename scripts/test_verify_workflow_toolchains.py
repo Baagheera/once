@@ -47,18 +47,41 @@ jobs:
 {CHECKOUT_STEP}{SETUP_STEP}{SCAN_STEP}{BUILD_STEP}"""
 
 
+def with_step_control(step: str, control: str) -> str:
+    return step.replace("\n", f"\n        {control}\n", 1)
+
+
 class WorkflowToolchainTests(unittest.TestCase):
     def assert_invalid(self, ci: str, release: str, message: str) -> None:
         failures = workflow.workflow_failures(ci, release)
         self.assertIn(message, "\n".join(failures))
 
+    def assert_releases_invalid(self, releases: list[str], message: str) -> None:
+        failures = [
+            "\n".join(workflow.workflow_failures(VALID_CI, release))
+            for release in releases
+        ]
+        self.assertTrue(all(message in failure for failure in failures), failures)
+
     def test_accepts_valid_ci_and_release_workflows(self) -> None:
         self.assertEqual(workflow.workflow_failures(VALID_CI, VALID_RELEASE), [])
+        ci_setup = with_step_control(SETUP_STEP, "continue-on-error: false")
+        ci = VALID_CI.replace(SETUP_STEP, ci_setup, 1)
+        release = VALID_RELEASE
+        for step in (CHECKOUT_STEP, SETUP_STEP, SCAN_STEP):
+            fail_closed = with_step_control(step, "continue-on-error: false")
+            release = release.replace(step, fail_closed)
+        self.assertEqual(workflow.workflow_failures(ci, release), [])
 
     def test_rejects_swapped_ci_job_versions(self) -> None:
         ci = VALID_CI.replace("go-version: 1.26.5", "go-version: SWAPPED", 1)
         ci = ci.replace("go-version: 1.25.12", "go-version: 1.26.5", 1)
         ci = ci.replace("go-version: SWAPPED", "go-version: 1.25.12", 1)
+        self.assert_invalid(ci, VALID_RELEASE, "ci.yml job test")
+
+    def test_rejects_conditional_setup_go_in_ci_test_job(self) -> None:
+        conditional = with_step_control(SETUP_STEP, "if: always()")
+        ci = VALID_CI.replace(SETUP_STEP, conditional, 1)
         self.assert_invalid(ci, VALID_RELEASE, "ci.yml job test")
 
     def test_rejects_commented_vulnerability_command(self) -> None:
@@ -75,6 +98,20 @@ class WorkflowToolchainTests(unittest.TestCase):
         release = VALID_RELEASE.replace(SCAN_STEP, conditional)
         self.assert_invalid(VALID_CI, release, "release.yml job build ordering")
 
+    def test_rejects_non_blocking_vulnerability_scan(self) -> None:
+        releases = []
+        for value in ("true", "${{ inputs.continue_on_error }}"):
+            non_blocking = with_step_control(SCAN_STEP, f"continue-on-error: {value}")
+            releases.append(VALID_RELEASE.replace(SCAN_STEP, non_blocking))
+        self.assert_releases_invalid(releases, "release.yml job build ordering")
+
+    def test_rejects_conditional_or_non_blocking_selected_tag_checkout(self) -> None:
+        releases = []
+        for control in ("if: always()", "continue-on-error: true"):
+            unsafe = with_step_control(CHECKOUT_STEP, control)
+            releases.append(VALID_RELEASE.replace(CHECKOUT_STEP, unsafe))
+        self.assert_releases_invalid(releases, "release.yml job build ordering")
+
     def test_rejects_scan_before_selected_tag_checkout(self) -> None:
         ordered = CHECKOUT_STEP + SETUP_STEP + SCAN_STEP + BUILD_STEP
         unsafe = SCAN_STEP + CHECKOUT_STEP + SETUP_STEP + BUILD_STEP
@@ -89,6 +126,16 @@ class WorkflowToolchainTests(unittest.TestCase):
 
     def test_rejects_wrong_release_setup_go_version(self) -> None:
         release = VALID_RELEASE.replace("go-version: 1.26.5", "go-version: 1.26.4")
+        self.assert_invalid(VALID_CI, release, "release.yml job build setup-go")
+
+    def test_rejects_conditional_release_setup_go(self) -> None:
+        conditional = with_step_control(SETUP_STEP, "if: always()")
+        release = VALID_RELEASE.replace(SETUP_STEP, conditional)
+        self.assert_invalid(VALID_CI, release, "release.yml job build setup-go")
+
+    def test_rejects_non_blocking_release_setup_go(self) -> None:
+        non_blocking = with_step_control(SETUP_STEP, "continue-on-error: true")
+        release = VALID_RELEASE.replace(SETUP_STEP, non_blocking)
         self.assert_invalid(VALID_CI, release, "release.yml job build setup-go")
 
     def test_rejects_unpinned_release_setup_go_action(self) -> None:

@@ -23,10 +23,16 @@ class Step:
     run: str | None = None
     go_version: str | None = None
     conditional: bool = False
+    continue_on_error: str | None = None
+
+
+def literal_scalar(value: str) -> str:
+    value = re.sub(r"\s+#.*$", "", value).strip()
+    return value
 
 
 def scalar(value: str) -> str:
-    value = re.sub(r"\s+#.*$", "", value).strip()
+    value = literal_scalar(value)
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
         return value[1:-1]
     return value
@@ -111,6 +117,7 @@ def parse_step(lines: list[str]) -> Step:
     run = None
     go_version = None
     conditional = False
+    continue_on_error = None
     with_indent = None
 
     for index, line in enumerate(lines):
@@ -136,14 +143,26 @@ def parse_step(lines: list[str]) -> Step:
             run = value
         elif key == "if" and line_indent <= base_indent + 2:
             conditional = True
+        elif key == "continue-on-error" and line_indent <= base_indent + 2:
+            continue_on_error = literal_scalar(text.partition(":")[2])
         elif key == "go-version" and with_indent is not None:
             go_version = value
 
-    return Step(uses=uses, run=run, go_version=go_version, conditional=conditional)
+    return Step(
+        uses=uses,
+        run=run,
+        go_version=go_version,
+        conditional=conditional,
+        continue_on_error=continue_on_error,
+    )
 
 
 def setup_go_steps(steps: list[Step]) -> list[Step]:
     return [step for step in steps if step.uses and step.uses.startswith("actions/setup-go@")]
+
+
+def required_step(step: Step) -> bool:
+    return not step.conditional and step.continue_on_error in (None, "false")
 
 
 def workflow_failures(ci: str, release: str) -> list[str]:
@@ -151,9 +170,14 @@ def workflow_failures(ci: str, release: str) -> list[str]:
 
     for job_name, version in (("test", CURRENT_GO), ("minimum-go", MINIMUM_GO)):
         setup = setup_go_steps(job_steps(ci, job_name))
-        if len(setup) != 1 or setup[0].go_version != version:
+        if (
+            len(setup) != 1
+            or setup[0].go_version != version
+            or not required_step(setup[0])
+        ):
             failures.append(
-                f"ci.yml job {job_name} setup-go must select Go {version} exactly once"
+                f"ci.yml job {job_name} setup-go must be unconditional, fail closed, "
+                f"and select Go {version} exactly once"
             )
 
     release_steps = job_steps(release, "build")
@@ -163,18 +187,27 @@ def workflow_failures(ci: str, release: str) -> list[str]:
         or release_setup[0].go_version != CURRENT_GO
         or not release_setup[0].uses
         or not SETUP_GO.fullmatch(release_setup[0].uses)
+        or not required_step(release_setup[0])
     ):
         failures.append(
-            "release.yml job build setup-go must use a full SHA and select "
-            f"Go {CURRENT_GO} exactly once"
+            "release.yml job build setup-go must be unconditional, fail closed, use "
+            f"a full SHA, and select Go {CURRENT_GO} exactly once"
         )
 
-    checkout = [index for index, step in enumerate(release_steps) if step.run == CHECKOUT_COMMAND]
-    setup = [index for index, step in enumerate(release_steps) if step in release_setup]
+    checkout = [
+        index
+        for index, step in enumerate(release_steps)
+        if step.run == CHECKOUT_COMMAND and required_step(step)
+    ]
+    setup = [
+        index
+        for index, step in enumerate(release_steps)
+        if step in release_setup and required_step(step)
+    ]
     scan = [
         index
         for index, step in enumerate(release_steps)
-        if step.run == VULN_COMMAND and not step.conditional
+        if step.run == VULN_COMMAND and required_step(step)
     ]
     build = [index for index, step in enumerate(release_steps) if step.run == BUILD_COMMAND]
     if not (
