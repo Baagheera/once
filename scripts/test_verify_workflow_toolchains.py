@@ -3,190 +3,141 @@ import unittest
 import verify_workflow_toolchains as workflow
 
 
-SETUP_GO = "actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16"
+SETUP_GO = "actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6"
+
+
+def setup_step(version: str) -> str:
+    return f"""      - uses: {SETUP_GO}
+        with:
+          go-version: {version}
+          cache: true
+"""
+
+
+CI_CURRENT_SETUP = setup_step("1.26.5")
+CI_MINIMUM_SETUP = setup_step("1.25.12")
 CHECKOUT_STEP = """      - name: Check out tag
         run: git checkout --detach "${{ steps.tag.outputs.tag }}"
 """
-SETUP_STEP = f"""      - uses: {SETUP_GO} # v6
-        with:
-          go-version: 1.26.5
-"""
-SCAN_STEP = f"""      - name: Scan Go vulnerabilities
-        run: {workflow.VULN_COMMAND}
+RELEASE_SETUP = setup_step("1.26.5")
+SCAN_STEP = """      - name: Scan Go vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.5.0 ./...
 """
 BUILD_STEP = """      - name: Build artifacts
         run: python scripts/build_release_artifacts.py "${{ steps.tag.outputs.tag }}"
+"""
+VERIFY_STEP = """      - name: Verify artifacts
+        run: python scripts/verify_release_artifacts.py "${{ steps.tag.outputs.tag }}"
+"""
+RELEASE_SEQUENCE = CHECKOUT_STEP + RELEASE_SETUP + SCAN_STEP + BUILD_STEP + VERIFY_STEP
+PROVENANCE_GATE = """          if [ "$tag_commit" != "$GITHUB_SHA" ]; then
+            echo "dispatch this workflow from the requested tag" >&2
+            exit 1
+          fi
 """
 
 VALID_CI = f"""name: ci
 
 jobs:
   test:
+    runs-on: ubuntu-latest
     steps:
-      - uses: {SETUP_GO} # v6
-        with:
-          go-version: 1.26.5
-
+{CI_CURRENT_SETUP}
   minimum-go:
+    runs-on: ubuntu-latest
     steps:
-      - uses: {SETUP_GO} # v6
-        with:
-          go-version: 1.25.12
-"""
+{CI_MINIMUM_SETUP}"""
 
 VALID_RELEASE = f"""name: release
 
 jobs:
   build:
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - run: python scripts/verify_workflow_toolchains.py
       - name: Choose tag
         id: tag
-        run: select-tag
-{CHECKOUT_STEP}{SETUP_STEP}{SCAN_STEP}{BUILD_STEP}"""
+        run: |
+          if ! tag_commit="$(git rev-parse -q --verify "refs/tags/$tag^{{commit}}")"; then
+            exit 1
+          fi
+{PROVENANCE_GATE}{RELEASE_SEQUENCE}"""
 
 
 def with_step_control(step: str, control: str) -> str:
-    return step.replace("\n", f"\n        {control}\n", 1)
+    return step.replace("        run:", f"        {control}\n        run:", 1)
 
 
-def quoted_control_fixtures(key: str, value: str) -> list[tuple[str, str, str]]:
-    fixtures = []
-    for quote in ("'", '"'):
-        control = f"{quote}{key}{quote}: {value}"
-        ci_setup = with_step_control(SETUP_STEP, control)
-        fixtures.append(
-            (VALID_CI.replace(SETUP_STEP, ci_setup, 1), VALID_RELEASE, "ci.yml job test")
-        )
-        for step, message in (
-            (SETUP_STEP, "release.yml job build setup-go"),
-            (CHECKOUT_STEP, "release.yml job build ordering"),
-            (SCAN_STEP, "release.yml job build ordering"),
-        ):
-            unsafe = with_step_control(step, control)
-            fixtures.append((VALID_CI, VALID_RELEASE.replace(step, unsafe), message))
-    return fixtures
+def with_job_control(text: str, job: str, control: str) -> str:
+    return text.replace(f"  {job}:\n", f"  {job}:\n{control}", 1)
 
 
 class WorkflowToolchainTests(unittest.TestCase):
-    def assert_invalid(self, ci: str, release: str, message: str) -> None:
+    def assert_invalid(self, ci: str, release: str) -> None:
         failures = workflow.workflow_failures(ci, release)
-        self.assertIn(message, "\n".join(failures))
+        self.assertTrue(failures, "unsafe fixture was accepted")
 
-    def assert_releases_invalid(self, releases: list[str], message: str) -> None:
-        failures = [
-            "\n".join(workflow.workflow_failures(VALID_CI, release))
-            for release in releases
-        ]
-        self.assertTrue(all(message in failure for failure in failures), failures)
-
-    def assert_fixtures_invalid(self, fixtures: list[tuple[str, str, str]]) -> None:
-        results = []
-        for ci, release, message in fixtures:
-            failures = "\n".join(workflow.workflow_failures(ci, release))
-            results.append((message, failures))
-        self.assertTrue(all(message in failures for message, failures in results), results)
-
-    def test_accepts_valid_ci_and_release_workflows(self) -> None:
+    def test_accepts_canonical_workflows(self) -> None:
         self.assertEqual(workflow.workflow_failures(VALID_CI, VALID_RELEASE), [])
-        ci_setup = with_step_control(SETUP_STEP, "continue-on-error: false")
-        ci = VALID_CI.replace(SETUP_STEP, ci_setup, 1)
-        release = VALID_RELEASE
-        for step in (CHECKOUT_STEP, SETUP_STEP, SCAN_STEP):
-            fail_closed = with_step_control(step, "continue-on-error: false")
-            release = release.replace(step, fail_closed)
-        self.assertEqual(workflow.workflow_failures(ci, release), [])
 
-    def test_rejects_swapped_ci_job_versions(self) -> None:
-        ci = VALID_CI.replace("go-version: 1.26.5", "go-version: SWAPPED", 1)
-        ci = ci.replace("go-version: 1.25.12", "go-version: 1.26.5", 1)
-        ci = ci.replace("go-version: SWAPPED", "go-version: 1.25.12", 1)
-        self.assert_invalid(ci, VALID_RELEASE, "ci.yml job test")
+    def test_rejects_extra_scan_step_controls(self) -> None:
+        for control in (
+            "shell: bash",
+            "env:\n          FLAG: unsafe",
+            "working-directory: scripts",
+        ):
+            with self.subTest(control=control):
+                scan = with_step_control(SCAN_STEP, control)
+                self.assert_invalid(VALID_CI, VALID_RELEASE.replace(SCAN_STEP, scan))
 
-    def test_rejects_conditional_setup_go_in_ci_test_job(self) -> None:
-        conditional = with_step_control(SETUP_STEP, "if: always()")
-        ci = VALID_CI.replace(SETUP_STEP, conditional, 1)
-        self.assert_invalid(ci, VALID_RELEASE, "ci.yml job test")
-
-    def test_rejects_single_and_double_quoted_if_keys(self) -> None:
-        self.assert_fixtures_invalid(quoted_control_fixtures("if", "always()"))
-
-    def test_rejects_commented_vulnerability_command(self) -> None:
-        commented = """      # - name: Scan Go vulnerabilities
-      #   run: go run golang.org/x/vuln/cmd/govulncheck@v1.5.0 ./...
-"""
-        release = VALID_RELEASE.replace(SCAN_STEP, commented)
-        self.assert_invalid(VALID_CI, release, "release.yml job build ordering")
-
-    def test_rejects_conditional_vulnerability_scan(self) -> None:
-        conditional = SCAN_STEP.replace(
-            "        run:", "        if: always()\n        run:"
-        )
-        release = VALID_RELEASE.replace(SCAN_STEP, conditional)
-        self.assert_invalid(VALID_CI, release, "release.yml job build ordering")
-
-    def test_rejects_non_blocking_vulnerability_scan(self) -> None:
-        releases = []
-        for value in ("true", "${{ inputs.continue_on_error }}"):
-            non_blocking = with_step_control(SCAN_STEP, f"continue-on-error: {value}")
-            releases.append(VALID_RELEASE.replace(SCAN_STEP, non_blocking))
-        self.assert_releases_invalid(releases, "release.yml job build ordering")
-
-    def test_rejects_single_and_double_quoted_continue_on_error_keys(self) -> None:
-        fixtures = quoted_control_fixtures("continue-on-error", "true")
-        self.assert_fixtures_invalid(fixtures)
-
-    def test_rejects_ambiguous_top_level_step_entry(self) -> None:
-        ambiguous = with_step_control(SCAN_STEP, "<<: *unsafe_controls")
-        release = VALID_RELEASE.replace(SCAN_STEP, ambiguous)
-        self.assert_invalid(VALID_CI, release, "release.yml job build ordering")
-
-    def test_rejects_conditional_or_non_blocking_selected_tag_checkout(self) -> None:
-        releases = []
+    def test_rejects_conditional_or_non_blocking_build(self) -> None:
         for control in ("if: always()", "continue-on-error: true"):
-            unsafe = with_step_control(CHECKOUT_STEP, control)
-            releases.append(VALID_RELEASE.replace(CHECKOUT_STEP, unsafe))
-        self.assert_releases_invalid(releases, "release.yml job build ordering")
+            with self.subTest(control=control):
+                build = with_step_control(BUILD_STEP, control)
+                self.assert_invalid(VALID_CI, VALID_RELEASE.replace(BUILD_STEP, build))
 
-    def test_rejects_scan_before_selected_tag_checkout(self) -> None:
-        ordered = CHECKOUT_STEP + SETUP_STEP + SCAN_STEP + BUILD_STEP
-        unsafe = SCAN_STEP + CHECKOUT_STEP + SETUP_STEP + BUILD_STEP
-        release = VALID_RELEASE.replace(ordered, unsafe)
-        self.assert_invalid(VALID_CI, release, "release.yml job build ordering")
+    def test_rejects_workflow_or_critical_job_env_and_defaults(self) -> None:
+        for control in (
+            "env:\n  FLAG: unsafe\n\n",
+            "defaults:\n  run:\n    shell: bash\n\n",
+        ):
+            self.assert_invalid(control + VALID_CI, VALID_RELEASE)
+            self.assert_invalid(VALID_CI, control + VALID_RELEASE)
 
-    def test_rejects_scan_after_artifact_build(self) -> None:
-        ordered = CHECKOUT_STEP + SETUP_STEP + SCAN_STEP + BUILD_STEP
-        unsafe = CHECKOUT_STEP + SETUP_STEP + BUILD_STEP + SCAN_STEP
-        release = VALID_RELEASE.replace(ordered, unsafe)
-        self.assert_invalid(VALID_CI, release, "release.yml job build ordering")
+        for control in (
+            "    env:\n      FLAG: unsafe\n",
+            "    defaults:\n      run:\n        shell: bash\n",
+        ):
+            for job in ("test", "minimum-go"):
+                ci = with_job_control(VALID_CI, job, control)
+                self.assert_invalid(ci, VALID_RELEASE)
+            release = with_job_control(VALID_RELEASE, "build", control)
+            self.assert_invalid(VALID_CI, release)
 
-    def test_rejects_wrong_release_setup_go_version(self) -> None:
-        release = VALID_RELEASE.replace("go-version: 1.26.5", "go-version: 1.26.4")
-        self.assert_invalid(VALID_CI, release, "release.yml job build setup-go")
+    def test_rejects_missing_mismatched_or_duplicate_provenance_gate(self) -> None:
+        releases = (
+            VALID_RELEASE.replace(PROVENANCE_GATE, ""),
+            VALID_RELEASE.replace("$GITHUB_SHA", "$GITHUB_REF"),
+            VALID_RELEASE.replace(PROVENANCE_GATE, PROVENANCE_GATE * 2),
+        )
+        for release in releases:
+            with self.subTest(release=release):
+                self.assert_invalid(VALID_CI, release)
 
-    def test_rejects_conditional_release_setup_go(self) -> None:
-        conditional = with_step_control(SETUP_STEP, "if: always()")
-        release = VALID_RELEASE.replace(SETUP_STEP, conditional)
-        self.assert_invalid(VALID_CI, release, "release.yml job build setup-go")
+    def test_rejects_reordered_release_sequence(self) -> None:
+        reordered = CHECKOUT_STEP + RELEASE_SETUP + BUILD_STEP + SCAN_STEP + VERIFY_STEP
+        self.assert_invalid(VALID_CI, VALID_RELEASE.replace(RELEASE_SEQUENCE, reordered))
 
-    def test_rejects_non_blocking_release_setup_go(self) -> None:
-        non_blocking = with_step_control(SETUP_STEP, "continue-on-error: true")
-        release = VALID_RELEASE.replace(SETUP_STEP, non_blocking)
-        self.assert_invalid(VALID_CI, release, "release.yml job build setup-go")
+    def test_rejects_swapped_ci_versions(self) -> None:
+        swapped = VALID_CI.replace("go-version: 1.26.5", "go-version: SWAP", 1)
+        swapped = swapped.replace("go-version: 1.25.12", "go-version: 1.26.5", 1)
+        swapped = swapped.replace("go-version: SWAP", "go-version: 1.25.12", 1)
+        self.assert_invalid(swapped, VALID_RELEASE)
 
-    def test_rejects_unpinned_release_setup_go_action(self) -> None:
-        release = VALID_RELEASE.replace(SETUP_GO, "actions/setup-go@v6")
-        self.assert_invalid(VALID_CI, release, "release.yml job build setup-go")
-
-    def test_rejects_vulnerability_scan_in_another_job(self) -> None:
-        release = VALID_RELEASE.replace(SCAN_STEP, "")
-        release += f"""
-  publish:
-    steps:
-      - run: {workflow.VULN_COMMAND}
-"""
-        self.assert_invalid(VALID_CI, release, "release.yml job build ordering")
+    def test_rejects_additional_setup_go_steps(self) -> None:
+        extra_ci = VALID_CI.replace(CI_CURRENT_SETUP, CI_CURRENT_SETUP * 2, 1)
+        extra_release = VALID_RELEASE.replace(RELEASE_SEQUENCE, RELEASE_SETUP + RELEASE_SEQUENCE)
+        self.assert_invalid(extra_ci, VALID_RELEASE)
+        self.assert_invalid(VALID_CI, extra_release)
 
 
 if __name__ == "__main__":

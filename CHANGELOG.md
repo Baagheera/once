@@ -14,6 +14,7 @@ User-facing changes are recorded here as releases are prepared.
 ### Changed
 
 - CI tests the supported Go lines with Go 1.26.5 and Go 1.25.12.
+- Manual release builds must be dispatched from the requested tag.
 
 ## v0.6.0 - 2026-07-06
 

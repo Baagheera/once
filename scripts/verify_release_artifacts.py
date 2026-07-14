@@ -11,12 +11,10 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from verify_workflow_toolchains import CURRENT_GO
-
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-EXPECTED_GO_VERSION = f"go{CURRENT_GO}"
+EXPECTED_GO_VERSION = "go1.26.5"
 TARGETS = (
     ("linux", "amd64", ".tar.gz", "once"),
     ("linux", "arm64", ".tar.gz", "once"),
@@ -92,16 +90,18 @@ def read_checksums(path: Path) -> dict[str, str]:
 
 def verify_tar(path: Path, binary: str) -> None:
     with tarfile.open(path, "r:gz") as tf:
-        members = {member.name: member for member in tf.getmembers()}
-        if set(members) != {binary, "README.md", "LICENSE"}:
-            raise RuntimeError(f"unexpected tar contents in {path.name}: {sorted(members)}")
-        for member in members.values():
+        members = tf.getmembers()
+        names = unique_member_names([member.name for member in members], path.name)
+        if names != {binary, "README.md", "LICENSE"}:
+            raise RuntimeError(f"unexpected tar contents in {path.name}: {sorted(names)}")
+        for member in members:
             reject_unsafe_archive_name(path, member.name)
             if not member.isfile():
                 raise RuntimeError(f"non-regular tar entry in {path.name}: {member.name}")
-        if members[binary].mode & 0o111 == 0:
+        binary_member = next(member for member in members if member.name == binary)
+        if binary_member.mode & 0o111 == 0:
             raise RuntimeError(f"{binary} is not executable in {path.name}")
-        binary_file = tf.extractfile(members[binary])
+        binary_file = tf.extractfile(binary_member)
         if binary_file is None:
             raise RuntimeError(f"cannot read {binary} from {path.name}")
         verify_archive_binary(binary_file.read(), binary, path.name)
@@ -109,10 +109,11 @@ def verify_tar(path: Path, binary: str) -> None:
 
 def verify_zip(path: Path, binary: str) -> None:
     with zipfile.ZipFile(path) as zf:
-        names = set(zf.namelist())
+        infos = zf.infolist()
+        names = unique_member_names([info.filename for info in infos], path.name)
         if names != {binary, "README.md", "LICENSE"}:
             raise RuntimeError(f"unexpected zip contents in {path.name}: {sorted(names)}")
-        for info in zf.infolist():
+        for info in infos:
             reject_unsafe_archive_name(path, info.filename)
             if info.is_dir():
                 raise RuntimeError(f"directory zip entry in {path.name}: {info.filename}")
@@ -121,6 +122,15 @@ def verify_zip(path: Path, binary: str) -> None:
             if file_type not in (0, stat.S_IFREG):
                 raise RuntimeError(f"non-regular zip entry in {path.name}: {info.filename}")
         verify_archive_binary(zf.read(binary), binary, path.name)
+
+
+def unique_member_names(names: list[str], archive: str) -> set[str]:
+    unique: set[str] = set()
+    for name in names:
+        if name in unique:
+            raise RuntimeError(f"duplicate archive member in {archive}: {name}")
+        unique.add(name)
+    return unique
 
 
 def verify_archive_binary(contents: bytes, binary: str, archive: str) -> None:

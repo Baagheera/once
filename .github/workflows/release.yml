@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Tag to package, such as v0.5.0
+        description: Tag to package; dispatch this workflow from the same tag
         required: true
 
 permissions:
@@ -55,6 +55,10 @@ jobs:
           git fetch --force origin main:refs/remotes/origin/main
           if ! tag_commit="$(git rev-parse -q --verify "refs/tags/$tag^{commit}")"; then
             echo "release tag does not exist: $tag" >&2
+            exit 1
+          fi
+          if [ "$tag_commit" != "$GITHUB_SHA" ]; then
+            echo "dispatch this workflow from the requested tag" >&2
             exit 1
           fi
           if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
