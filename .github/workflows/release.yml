@@ -32,10 +32,13 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - run: python scripts/verify_workflow_toolchains.py
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: 1.26.x
+          go-version: 1.26.5
           cache: true
+      - name: Scan Go vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.5.0 ./...
       - name: Choose tag
         id: tag
         shell: bash
