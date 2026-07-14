@@ -24,6 +24,7 @@ class Step:
     go_version: str | None = None
     conditional: bool = False
     continue_on_error: str | None = None
+    ambiguous: bool = False
 
 
 def literal_scalar(value: str) -> str:
@@ -40,6 +41,9 @@ def scalar(value: str) -> str:
 
 def mapping_entry(text: str) -> tuple[str, str] | None:
     key, separator, value = text.partition(":")
+    key = key.strip()
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in "\"'":
+        key = key[1:-1]
     if not separator or not re.fullmatch(r"[A-Za-z0-9_-]+", key):
         return None
     return key, scalar(value)
@@ -118,11 +122,13 @@ def parse_step(lines: list[str]) -> Step:
     go_version = None
     conditional = False
     continue_on_error = None
+    ambiguous = False
     with_indent = None
 
     for index, line in enumerate(lines):
         line_indent = indentation(line)
         text = line.strip()
+        top_level = index == 0 or line_indent == base_indent + 2
         if index == 0:
             text = text[1:].lstrip()
             entry = mapping_entry(text)
@@ -135,6 +141,8 @@ def parse_step(lines: list[str]) -> Step:
             entry = None
 
         if entry is None:
+            if top_level:
+                ambiguous = True
             continue
         key, value = entry
         if key == "uses" and line_indent <= base_indent + 2:
@@ -154,6 +162,7 @@ def parse_step(lines: list[str]) -> Step:
         go_version=go_version,
         conditional=conditional,
         continue_on_error=continue_on_error,
+        ambiguous=ambiguous,
     )
 
 
@@ -162,7 +171,11 @@ def setup_go_steps(steps: list[Step]) -> list[Step]:
 
 
 def required_step(step: Step) -> bool:
-    return not step.conditional and step.continue_on_error in (None, "false")
+    return (
+        not step.conditional
+        and step.continue_on_error in (None, "false")
+        and not step.ambiguous
+    )
 
 
 def workflow_failures(ci: str, release: str) -> list[str]:

@@ -51,6 +51,24 @@ def with_step_control(step: str, control: str) -> str:
     return step.replace("\n", f"\n        {control}\n", 1)
 
 
+def quoted_control_fixtures(key: str, value: str) -> list[tuple[str, str, str]]:
+    fixtures = []
+    for quote in ("'", '"'):
+        control = f"{quote}{key}{quote}: {value}"
+        ci_setup = with_step_control(SETUP_STEP, control)
+        fixtures.append(
+            (VALID_CI.replace(SETUP_STEP, ci_setup, 1), VALID_RELEASE, "ci.yml job test")
+        )
+        for step, message in (
+            (SETUP_STEP, "release.yml job build setup-go"),
+            (CHECKOUT_STEP, "release.yml job build ordering"),
+            (SCAN_STEP, "release.yml job build ordering"),
+        ):
+            unsafe = with_step_control(step, control)
+            fixtures.append((VALID_CI, VALID_RELEASE.replace(step, unsafe), message))
+    return fixtures
+
+
 class WorkflowToolchainTests(unittest.TestCase):
     def assert_invalid(self, ci: str, release: str, message: str) -> None:
         failures = workflow.workflow_failures(ci, release)
@@ -62,6 +80,13 @@ class WorkflowToolchainTests(unittest.TestCase):
             for release in releases
         ]
         self.assertTrue(all(message in failure for failure in failures), failures)
+
+    def assert_fixtures_invalid(self, fixtures: list[tuple[str, str, str]]) -> None:
+        results = []
+        for ci, release, message in fixtures:
+            failures = "\n".join(workflow.workflow_failures(ci, release))
+            results.append((message, failures))
+        self.assertTrue(all(message in failures for message, failures in results), results)
 
     def test_accepts_valid_ci_and_release_workflows(self) -> None:
         self.assertEqual(workflow.workflow_failures(VALID_CI, VALID_RELEASE), [])
@@ -84,6 +109,9 @@ class WorkflowToolchainTests(unittest.TestCase):
         ci = VALID_CI.replace(SETUP_STEP, conditional, 1)
         self.assert_invalid(ci, VALID_RELEASE, "ci.yml job test")
 
+    def test_rejects_single_and_double_quoted_if_keys(self) -> None:
+        self.assert_fixtures_invalid(quoted_control_fixtures("if", "always()"))
+
     def test_rejects_commented_vulnerability_command(self) -> None:
         commented = """      # - name: Scan Go vulnerabilities
       #   run: go run golang.org/x/vuln/cmd/govulncheck@v1.5.0 ./...
@@ -104,6 +132,15 @@ class WorkflowToolchainTests(unittest.TestCase):
             non_blocking = with_step_control(SCAN_STEP, f"continue-on-error: {value}")
             releases.append(VALID_RELEASE.replace(SCAN_STEP, non_blocking))
         self.assert_releases_invalid(releases, "release.yml job build ordering")
+
+    def test_rejects_single_and_double_quoted_continue_on_error_keys(self) -> None:
+        fixtures = quoted_control_fixtures("continue-on-error", "true")
+        self.assert_fixtures_invalid(fixtures)
+
+    def test_rejects_ambiguous_top_level_step_entry(self) -> None:
+        ambiguous = with_step_control(SCAN_STEP, "<<: *unsafe_controls")
+        release = VALID_RELEASE.replace(SCAN_STEP, ambiguous)
+        self.assert_invalid(VALID_CI, release, "release.yml job build ordering")
 
     def test_rejects_conditional_or_non_blocking_selected_tag_checkout(self) -> None:
         releases = []
