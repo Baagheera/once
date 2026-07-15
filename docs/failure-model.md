@@ -142,9 +142,12 @@ attempt.
 
 ## Large stdout or stderr
 
-`once run` currently buffers stdout and stderr in memory, then stores them in
-SQLite after the command exits. Very large output can put pressure on memory and
-make the database large.
+`once run` buffers stdout and stderr in memory, then stores them in SQLite after
+the command exits. The default budget is 16 MiB combined. If output exceeds the
+configured `--max-output-bytes` value, once keeps the bytes within the budget,
+discards the rest without stopping the child, and commits a `failed` result with
+exit code `125`. Raising the budget can increase both memory use and database
+size.
 
 If once dies after the child produced output but before commit, that output is
 not available from once. The record remains `running`.
@@ -175,6 +178,11 @@ delete `running` records, and should be treated as an explicit operator action.
 `prune` is a dry run unless `--force` is set. It is for old terminal records
 only and does not delete `running` records; those still need a deliberate repair
 decision.
+
+Forced prune commits at most 5,000 deletions per batch. It is not atomic across
+the complete candidate set: after an interruption or error, earlier batches
+remain deleted. Run the dry run again before resuming if the failure could have
+changed which records you intend to remove.
 
 Before force-deleting a `running` record, answer two questions outside once:
 

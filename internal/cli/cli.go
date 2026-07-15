@@ -18,14 +18,16 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"text/tabwriter"
 	"time"
 
 	once "github.com/Baagheera/once/internal/once"
 	"github.com/Baagheera/once/internal/server"
 )
 
-const defaultStorePath = "once.db"
+const (
+	defaultStorePath      = "once.db"
+	defaultMaxOutputBytes = int64(16 << 20)
+)
 const minAuthTokenLength = 32
 
 func Run(args []string, stdout, stderr io.Writer) int {
@@ -84,7 +86,7 @@ func runCommand(args []string, storePath string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	key := fs.String("key", "", "idempotency key")
 	timeout := fs.Duration("timeout", 0, "maximum command runtime")
-	maxOutputBytes := fs.Int64("max-output-bytes", 0, "maximum stored stdout and stderr bytes")
+	maxOutputBytes := fs.Int64("max-output-bytes", defaultMaxOutputBytes, "maximum combined stored stdout and stderr bytes")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -97,12 +99,6 @@ func runCommand(args []string, storePath string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "once: --max-output-bytes must be non-negative")
 		return 2
 	}
-	limitOutput := false
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "max-output-bytes" {
-			limitOutput = true
-		}
-	})
 	if *key == "" {
 		fmt.Fprintln(stderr, "once: run needs --key")
 		return 2
@@ -133,7 +129,7 @@ func runCommand(args []string, storePath string, stdout, stderr io.Writer) int {
 		return replayRecord(rec, stdout, stderr)
 	}
 
-	exitCode, out, errOut, runErr := execute(command, *timeout, *maxOutputBytes, limitOutput)
+	exitCode, out, errOut, runErr := execute(command, *timeout, *maxOutputBytes)
 	state := once.Succeeded
 	if exitCode != 0 || runErr != "" {
 		state = once.Failed
@@ -328,23 +324,27 @@ func listCommand(args []string, storePath string, stdout, stderr io.Writer) int 
 	if !ok {
 		return 2
 	}
-	records, code := listRecords(storePath, opts, stderr)
-	if code != 0 {
-		return code
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		fmt.Fprintf(stderr, "once: open store: %v\n", err)
+		return 1
 	}
+	defer store.Close()
 
-	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "KEY\tSTATE\tEXIT\tUPDATED\tCOMMAND")
-	for _, rec := range records {
-		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\n",
+	if _, err := fmt.Fprintln(stdout, "KEY\tSTATE\tEXIT\tUPDATED\tCOMMAND"); err != nil {
+		fmt.Fprintf(stderr, "once: list: %v\n", err)
+		return 1
+	}
+	if err := store.ForEachRecord(opts, func(rec once.Record) error {
+		_, err := fmt.Fprintf(stdout, "%s\t%s\t%d\t%s\t%s\n",
 			rec.Key,
 			rec.State,
 			rec.ExitCode,
 			rec.UpdatedAt.Format(time.RFC3339),
 			formatCommand(rec.Command),
 		)
-	}
-	if err := tw.Flush(); err != nil {
+		return err
+	}); err != nil {
 		fmt.Fprintf(stderr, "once: list: %v\n", err)
 		return 1
 	}
@@ -371,17 +371,19 @@ func exportCommand(args []string, storePath string, stdout, stderr io.Writer) in
 		return 2
 	}
 	opts.IncludeOutput = *includeOutput
-	records, code := listRecords(storePath, opts, stderr)
-	if code != 0 {
-		return code
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		fmt.Fprintf(stderr, "once: open store: %v\n", err)
+		return 1
 	}
+	defer store.Close()
 
 	enc := json.NewEncoder(stdout)
-	for _, rec := range records {
-		if err := enc.Encode(recordDoc(rec, *includeOutput)); err != nil {
-			fmt.Fprintf(stderr, "once: export: %v\n", err)
-			return 1
-		}
+	if err := store.ForEachRecord(opts, func(rec once.Record) error {
+		return enc.Encode(recordDoc(rec, *includeOutput))
+	}); err != nil {
+		fmt.Fprintf(stderr, "once: export: %v\n", err)
+		return 1
 	}
 	return 0
 }
@@ -412,32 +414,40 @@ func pruneCommand(args []string, storePath string, stdout, stderr io.Writer) int
 	}
 	defer store.Close()
 
-	result, err := store.Prune(opts)
-	if err != nil {
-		fmt.Fprintf(stderr, "once: prune: %v\n", err)
-		return 1
-	}
-
 	if opts.Force {
+		result, err := store.Prune(opts)
+		if err != nil {
+			fmt.Fprintf(stderr, "once: prune: %v\n", err)
+			return 1
+		}
 		fmt.Fprintf(stdout, "pruned %d %s\n", result.Deleted, recordLabel(result.Deleted))
 		return 0
 	}
 
-	fmt.Fprintf(stdout, "would prune %d %s\n", len(result.Records), recordLabel(len(result.Records)))
-	if len(result.Records) == 0 {
-		return 0
-	}
-	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "KEY\tSTATE\tUPDATED\tCOMMAND")
-	for _, rec := range result.Records {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n",
+	count := 0
+	wroteHeader := false
+	if err := store.ForEachPruneCandidate(opts, func(rec once.Record) error {
+		if !wroteHeader {
+			if _, err := fmt.Fprintln(stdout, "KEY\tSTATE\tUPDATED\tCOMMAND"); err != nil {
+				return err
+			}
+			wroteHeader = true
+		}
+		_, err := fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\n",
 			rec.Key,
 			rec.State,
 			rec.UpdatedAt.Format(time.RFC3339),
 			formatCommand(rec.Command),
 		)
+		if err == nil {
+			count++
+		}
+		return err
+	}); err != nil {
+		fmt.Fprintf(stderr, "once: prune: %v\n", err)
+		return 1
 	}
-	if err := tw.Flush(); err != nil {
+	if _, err := fmt.Fprintf(stdout, "would prune %d %s\n", count, recordLabel(count)); err != nil {
 		fmt.Fprintf(stderr, "once: prune: %v\n", err)
 		return 1
 	}
@@ -499,22 +509,6 @@ func loadRecord(storePath string, key string, stderr io.Writer) (once.Record, in
 		return once.Record{}, 1
 	}
 	return rec, 0
-}
-
-func listRecords(storePath string, opts once.ListOptions, stderr io.Writer) ([]once.Record, int) {
-	store, err := once.OpenSQLite(storePath)
-	if err != nil {
-		fmt.Fprintf(stderr, "once: open store: %v\n", err)
-		return nil, 1
-	}
-	defer store.Close()
-
-	records, err := store.List(opts)
-	if err != nil {
-		fmt.Fprintf(stderr, "once: list: %v\n", err)
-		return nil, 1
-	}
-	return records, 0
 }
 
 func listOptions(state string, limit int, olderThan string, now time.Time, stderr io.Writer) (once.ListOptions, bool) {
@@ -651,22 +645,16 @@ func formatCommand(command []string) string {
 	return strings.Join(quoted, " ")
 }
 
-func execute(command []string, timeout time.Duration, maxOutputBytes int64, limitOutput bool) (int, []byte, []byte, string) {
+func execute(command []string, timeout time.Duration, maxOutputBytes int64) (int, []byte, []byte, string) {
 	cmd := exec.Command(command[0], command[1:]...)
 	if timeout > 0 {
 		prepareTimeoutCommand(cmd)
 	}
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	var outputLimit *limitedOutput
-	if limitOutput {
-		outputLimit = &limitedOutput{max: maxOutputBytes}
-		cmd.Stdout = outputLimit.writer(&stdout)
-		cmd.Stderr = outputLimit.writer(&stderr)
-	} else {
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-	}
+	outputLimit := &limitedOutput{max: maxOutputBytes}
+	cmd.Stdout = outputLimit.writer(&stdout)
+	cmd.Stderr = outputLimit.writer(&stderr)
 
 	err, timedOut := runProcess(cmd, timeout)
 	exitCode := 0
@@ -686,7 +674,7 @@ func execute(command []string, timeout time.Duration, maxOutputBytes int64, limi
 		}
 	}
 
-	if outputLimit != nil && outputLimit.exceededLimit() {
+	if outputLimit.exceededLimit() {
 		limitErr := fmt.Sprintf("output exceeded --max-output-bytes=%d", maxOutputBytes)
 		if runErr == "" {
 			runErr = limitErr

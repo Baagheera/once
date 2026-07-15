@@ -427,11 +427,37 @@ WHERE key = ?
 }
 
 func (s *SQLiteStore) List(opts ListOptions) ([]Record, error) {
+	var records []Record
+	if err := s.ForEachRecord(opts, func(rec Record) error {
+		records = append(records, rec)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return records, nil
+}
+
+func (s *SQLiteStore) ForEachRecord(opts ListOptions, visit func(Record) error) error {
+	if visit == nil {
+		return fmt.Errorf("nil record visitor")
+	}
+	query, args, err := listQuery(opts)
+	if err != nil {
+		return err
+	}
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return err
+	}
+	return forEachScannedRecord(rows, visit)
+}
+
+func listQuery(opts ListOptions) (string, []any, error) {
 	if opts.Limit < 0 {
-		return nil, fmt.Errorf("limit must be non-negative")
+		return "", nil, fmt.Errorf("limit must be non-negative")
 	}
 	if opts.State != "" && opts.State != Running && opts.State != Succeeded && opts.State != Failed {
-		return nil, fmt.Errorf("invalid state: %s", opts.State)
+		return "", nil, fmt.Errorf("invalid state: %s", opts.State)
 	}
 
 	outputColumns := "X'' AS stdout, X'' AS stderr"
@@ -461,132 +487,114 @@ FROM once_records
 		query += "LIMIT ?\n"
 		args = append(args, opts.Limit)
 	}
+	return query, args, nil
+}
 
-	rows, err := s.db.Query(query, args...)
-	if err != nil {
-		return nil, err
-	}
+func forEachScannedRecord(rows *sql.Rows, visit func(Record) error) error {
 	defer rows.Close()
-
-	var records []Record
 	for rows.Next() {
 		rec, err := scanRecord(rows)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		rec.Attempt = ""
-		records = append(records, rec)
+		if err := visit(rec); err != nil {
+			return err
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return err
 	}
-	return records, nil
+	return rows.Close()
 }
 
 func (s *SQLiteStore) Prune(opts PruneOptions) (PruneResult, error) {
-	if opts.State != Succeeded && opts.State != Failed {
-		return PruneResult{}, fmt.Errorf("prune state must be succeeded or failed")
+	if err := validatePruneOptions(opts); err != nil {
+		return PruneResult{}, err
 	}
-	if opts.Cutoff.IsZero() {
-		return PruneResult{}, fmt.Errorf("prune cutoff is required")
-	}
-
-	ctx := context.Background()
 	if opts.Force {
-		return s.pruneForced(ctx, opts)
+		return s.pruneForced(context.Background(), opts)
 	}
 
-	records, err := pruneCandidates(ctx, s.db, opts)
-	if err != nil {
+	var records []Record
+	if err := s.forEachPruneCandidate(context.Background(), opts, func(rec Record) error {
+		records = append(records, rec)
+		return nil
+	}); err != nil {
 		return PruneResult{}, err
 	}
 	return PruneResult{Records: records}, nil
 }
 
-type pruneRunner interface {
-	ExecContext(context.Context, string, ...any) (sql.Result, error)
-	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+func (s *SQLiteStore) ForEachPruneCandidate(opts PruneOptions, visit func(Record) error) error {
+	if visit == nil {
+		return fmt.Errorf("nil prune candidate visitor")
+	}
+	if err := validatePruneOptions(opts); err != nil {
+		return err
+	}
+	return s.forEachPruneCandidate(context.Background(), opts, visit)
 }
 
-func pruneCandidates(ctx context.Context, runner pruneRunner, opts PruneOptions) ([]Record, error) {
+func validatePruneOptions(opts PruneOptions) error {
+	if opts.State != Succeeded && opts.State != Failed {
+		return fmt.Errorf("prune state must be succeeded or failed")
+	}
+	if opts.Cutoff.IsZero() {
+		return fmt.Errorf("prune cutoff is required")
+	}
+	return nil
+}
+
+func (s *SQLiteStore) forEachPruneCandidate(ctx context.Context, opts PruneOptions, visit func(Record) error) error {
 	updatedAtExpr := sqliteSortableTimeExpr("updated_at")
-	rows, err := runner.QueryContext(ctx, `
+	rows, err := s.db.QueryContext(ctx, `
 SELECT key, attempt_hash, state, exit_code, X'' AS stdout, X'' AS stderr, error, command, started_at, finished_at, updated_at
 FROM once_records
 WHERE state = ? AND `+updatedAtExpr+` < ?
 ORDER BY `+updatedAtExpr+` ASC, key ASC
 `, string(opts.State), formatSortableTime(opts.Cutoff))
 	if err != nil {
-		return nil, err
+		return err
 	}
-
-	var records []Record
-	for rows.Next() {
-		rec, err := scanRecord(rows)
-		if err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		rec.Attempt = ""
-		records = append(records, rec)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return records, nil
+	return forEachScannedRecord(rows, visit)
 }
 
-func deletePruneCandidates(ctx context.Context, runner pruneRunner, records []Record) (int, error) {
-	var deleted int
-	for _, rec := range records {
-		res, err := runner.ExecContext(ctx, `
+const pruneBatchSize = 5000
+
+func (s *SQLiteStore) pruneForced(ctx context.Context, opts PruneOptions) (PruneResult, error) {
+	updatedAtExpr := sqliteSortableTimeExpr("updated_at")
+	query := `
 DELETE FROM once_records
-WHERE key = ? AND state = ? AND updated_at = ?
-`, rec.Key, string(rec.State), formatTime(rec.UpdatedAt))
+WHERE key IN (
+	SELECT key
+	FROM once_records
+	WHERE state = ? AND ` + updatedAtExpr + ` < ?
+	ORDER BY ` + updatedAtExpr + ` ASC, key ASC
+	LIMIT ?
+)
+`
+	result := PruneResult{}
+	for {
+		res, err := s.db.ExecContext(
+			ctx,
+			query,
+			string(opts.State),
+			formatSortableTime(opts.Cutoff),
+			pruneBatchSize,
+		)
 		if err != nil {
-			return 0, err
+			return result, fmt.Errorf("prune stopped after deleting %d records: %w", result.Deleted, err)
 		}
 		affected, err := res.RowsAffected()
 		if err != nil {
-			return 0, err
+			return result, fmt.Errorf("count prune batch after deleting %d records: %w", result.Deleted, err)
 		}
-		deleted += int(affected)
-	}
-	return deleted, nil
-}
-
-func (s *SQLiteStore) pruneForced(ctx context.Context, opts PruneOptions) (PruneResult, error) {
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return PruneResult{}, err
-	}
-	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
-		return PruneResult{}, err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		result.Deleted += int(affected)
+		if affected < pruneBatchSize {
+			return result, nil
 		}
-	}()
-
-	records, err := pruneCandidates(ctx, conn, opts)
-	if err != nil {
-		return PruneResult{}, err
 	}
-	deleted, err := deletePruneCandidates(ctx, conn, records)
-	if err != nil {
-		return PruneResult{}, err
-	}
-	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
-		return PruneResult{}, err
-	}
-	committed = true
-	return PruneResult{Records: records, Deleted: deleted}, nil
 }
 
 func (s *SQLiteStore) Forget(key string, force bool, attempt string) (bool, error) {

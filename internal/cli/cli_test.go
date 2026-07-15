@@ -393,6 +393,48 @@ func TestRunStoresAndReplaysLargeStdout(t *testing.T) {
 	}
 }
 
+func TestRunLimitsStoredOutputByDefault(t *testing.T) {
+	t.Setenv("ONCE_TEST_HELPER", "1")
+
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	cmd := helperCommand("stdout", strconv.FormatInt(defaultMaxOutputBytes+1, 10))
+
+	var out, errOut bytes.Buffer
+	code := Run(append([]string{"--store", storePath, "run", "--key", "demo", "--"}, cmd...), &out, &errOut)
+	if code != 125 {
+		t.Fatalf("run code = %d stderr = %s", code, errOut.String())
+	}
+	if int64(out.Len()) != defaultMaxOutputBytes {
+		t.Fatalf("stdout len = %d, want %d", out.Len(), defaultMaxOutputBytes)
+	}
+	wantError := "output exceeded --max-output-bytes=" + strconv.FormatInt(defaultMaxOutputBytes, 10)
+	if !strings.Contains(errOut.String(), wantError) {
+		t.Fatalf("stderr = %q, want %q", errOut.String(), wantError)
+	}
+
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	rec, err := store.Get("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != once.Failed {
+		t.Fatalf("state = %s, want %s", rec.State, once.Failed)
+	}
+	if rec.ExitCode != 125 {
+		t.Fatalf("exit code = %d, want 125", rec.ExitCode)
+	}
+	if int64(len(rec.Stdout)+len(rec.Stderr)) != defaultMaxOutputBytes {
+		t.Fatalf("stored output len = %d, want %d", len(rec.Stdout)+len(rec.Stderr), defaultMaxOutputBytes)
+	}
+	if rec.Error != wantError {
+		t.Fatalf("stored error = %q, want %q", rec.Error, wantError)
+	}
+}
+
 func TestRunCompletesWithinMaxOutputBytes(t *testing.T) {
 	t.Setenv("ONCE_TEST_HELPER", "1")
 
@@ -1066,6 +1108,9 @@ func TestListShowsRecords(t *testing.T) {
 		t.Fatalf("list code = %d stderr = %s", code, errOut.String())
 	}
 	listed := out.String()
+	if !strings.HasPrefix(listed, "KEY\tSTATE\tEXIT\tUPDATED\tCOMMAND\n") {
+		t.Fatalf("list header is not TSV: %q", listed)
+	}
 	for _, want := range []string{"KEY", "STATE", "EXIT", "UPDATED", "COMMAND", "done", "succeeded", "bad", "failed", "stuck", "running"} {
 		if !strings.Contains(listed, want) {
 			t.Fatalf("list output missing %q:\n%s", want, listed)
@@ -1128,6 +1173,52 @@ func TestExportJSONLRedactsOutputByDefault(t *testing.T) {
 	}
 	if value, ok := docs[0]["stderr_b64"]; !ok || value != "" {
 		t.Fatalf("stderr_b64 = %#v, present=%v", value, ok)
+	}
+}
+
+func TestListAndExportEmitRecordsIncrementally(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"good", "broken"} {
+		if _, _, err := store.Reserve(key, []string{"echo", key}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	base := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	setRecordUpdatedAt(t, storePath, "good", base.Add(time.Second))
+	setRecordUpdatedAt(t, storePath, "broken", base)
+	db := openDoctorTestDB(t, storePath)
+	execDoctorTestSQL(t, db, `UPDATE once_records SET command = 'not-json' WHERE key = 'broken'`)
+	closeDoctorTestDB(t, db, storePath)
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "list"}, &out, &errOut)
+	if code != 1 {
+		t.Fatalf("list code = %d, want 1", code)
+	}
+	if !strings.Contains(out.String(), "good") {
+		t.Fatalf("list did not emit valid record before scan failure: %q", out.String())
+	}
+	if strings.Contains(out.String(), "broken") {
+		t.Fatalf("list emitted malformed record: %q", out.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"--store", storePath, "export"}, &out, &errOut)
+	if code != 1 {
+		t.Fatalf("export code = %d, want 1", code)
+	}
+	docs := decodeExport(t, out.String())
+	if len(docs) != 1 || docs[0]["key"] != "good" {
+		t.Fatalf("exported docs before scan failure = %#v, want good", docs)
 	}
 }
 
@@ -1398,6 +1489,9 @@ func TestPruneDryRunThenForce(t *testing.T) {
 		t.Fatalf("dry-run prune code = %d stderr = %s", code, errOut.String())
 	}
 	dryRun := out.String()
+	if !strings.Contains(dryRun, "KEY\tSTATE\tUPDATED\tCOMMAND\n") {
+		t.Fatalf("dry-run header is not TSV: %q", dryRun)
+	}
 	if !strings.Contains(dryRun, "would prune 1 record") || !strings.Contains(dryRun, "done") {
 		t.Fatalf("dry-run output = %q", dryRun)
 	}
@@ -1436,6 +1530,48 @@ func TestPruneDryRunThenForce(t *testing.T) {
 	}
 	if _, err := store.Get("stuck"); err != nil {
 		t.Fatalf("stuck err = %v, want record to remain", err)
+	}
+}
+
+func TestPruneDryRunEmitsCandidatesIncrementally(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"good", "broken"} {
+		rec, fresh, err := store.Reserve(key, []string{"echo", key})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !fresh {
+			t.Fatalf("%s reservation was not fresh", key)
+		}
+		if _, err := store.Commit(key, rec.Attempt, once.Succeeded, 0, nil, nil, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	base := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	setRecordUpdatedAt(t, storePath, "good", base)
+	setRecordUpdatedAt(t, storePath, "broken", base.Add(time.Second))
+	db := openDoctorTestDB(t, storePath)
+	execDoctorTestSQL(t, db, `UPDATE once_records SET command = 'not-json' WHERE key = 'broken'`)
+	closeDoctorTestDB(t, db, storePath)
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "prune", "--state", "succeeded", "--older-than", "1ns"}, &out, &errOut)
+	if code != 1 {
+		t.Fatalf("prune code = %d, want 1", code)
+	}
+	if !strings.Contains(out.String(), "good") {
+		t.Fatalf("prune did not emit valid candidate before scan failure: %q", out.String())
+	}
+	if strings.Contains(out.String(), "broken") {
+		t.Fatalf("prune emitted malformed candidate: %q", out.String())
 	}
 }
 

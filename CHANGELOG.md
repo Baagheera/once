@@ -17,6 +17,13 @@ User-facing changes are recorded here as releases are prepared.
   being reported as invalid commit or delete requests.
 - `once serve` binds before announcing its listener and drains active requests
   on process shutdown.
+- `once run` now stores at most 16 MiB of combined stdout and stderr by default.
+  `--max-output-bytes` can raise or lower that budget.
+- `list`, `export`, and prune dry runs process records incrementally instead of
+  collecting the full result set in memory. Operator tables now use
+  tab-separated columns so each row can be written immediately.
+- Forced prune commits at most 5,000 deletions per batch, so a failure can leave
+  earlier batches deleted and a rerun can finish the same cleanup.
 
 ### Fixed
 
