@@ -45,11 +45,15 @@ def verify_dist(version: str) -> None:
 
     expected = {archive_name(version, goos, goarch, suffix) for goos, goarch, suffix, _ in TARGETS}
     expected.add("SHA256SUMS")
-    actual = {path.name for path in DIST.iterdir() if path.is_file()}
+    entries = list(DIST.iterdir())
+    actual = {path.name for path in entries}
     if actual != expected:
         missing = sorted(expected - actual)
         extra = sorted(actual - expected)
         raise RuntimeError(f"unexpected dist files; missing={missing} extra={extra}")
+    for path in entries:
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"non-regular dist entry: {path.name}")
 
     checksums = read_checksums(DIST / "SHA256SUMS")
     if set(checksums) != expected - {"SHA256SUMS"}:
@@ -84,6 +88,8 @@ def read_checksums(path: Path) -> dict[str, str]:
         digest, filename = line.split(maxsplit=1)
         if len(digest) != 64:
             raise RuntimeError(f"invalid digest for {filename}")
+        if filename in checksums:
+            raise RuntimeError(f"duplicate checksum entry for {filename}")
         checksums[filename] = digest
     return checksums
 

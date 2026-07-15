@@ -1,4 +1,7 @@
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import verify_release_artifacts as artifacts
 
@@ -26,6 +29,32 @@ class GoMetadataTests(unittest.TestCase):
             artifacts.unique_member_names(
                 ["once", "README.md", "once", "LICENSE"], "release.tar.gz"
             )
+
+    def test_rejects_unexpected_directory_in_dist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dist = Path(tmp)
+            (dist / "SHA256SUMS").write_text("", encoding="utf-8")
+            (dist / "unexpected").mkdir()
+
+            with (
+                mock.patch.object(artifacts, "DIST", dist),
+                mock.patch.object(artifacts, "TARGETS", ()),
+                mock.patch.object(artifacts, "smoke_linux_amd64"),
+                self.assertRaisesRegex(RuntimeError, "unexpected dist files"),
+            ):
+                artifacts.verify_dist("v0.6.1")
+
+    def test_rejects_duplicate_checksum_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "SHA256SUMS"
+            manifest.write_text(
+                f"{'a' * 64}  once_v0.6.1_linux_amd64.tar.gz\n"
+                f"{'b' * 64}  once_v0.6.1_linux_amd64.tar.gz\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "duplicate checksum entry"):
+                artifacts.read_checksums(manifest)
 
 
 if __name__ == "__main__":
