@@ -8,6 +8,8 @@ User-facing changes are recorded here as releases are prepared.
 
 - The Go HTTP client no longer follows redirects, keeping bearer tokens,
   attempt tokens, and commit bodies bound to the configured server.
+- Newly created Windows store and token directories use protected user-only
+  DACLs. Existing paths with unsafe ancestors are still rejected.
 
 ### Changed
 
@@ -15,6 +17,11 @@ User-facing changes are recorded here as releases are prepared.
   being reported as invalid commit or delete requests.
 - `once serve` binds before announcing its listener and drains active requests
   on process shutdown.
+
+### Fixed
+
+- The PowerShell quick start now uses a missing per-user application-data
+  directory instead of the shared temporary directory.
 
 ## v0.6.1 - 2026-07-15
 

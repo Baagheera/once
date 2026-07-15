@@ -134,7 +134,18 @@ func openSQLite(path string, options sqliteInitOptions) (*SQLiteStore, error) {
 		return nil, err
 	}
 	if dir := filepath.Dir(path); dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
+		info, err := os.Stat(dir)
+		switch {
+		case err == nil && !info.IsDir():
+			return nil, fmt.Errorf("sqlite parent is not a directory: %s", dir)
+		case os.IsNotExist(err):
+			if err := RejectSharedWritableParent(path); err != nil {
+				return nil, err
+			}
+			if err := MkdirAllPrivate(dir); err != nil {
+				return nil, err
+			}
+		case err != nil:
 			return nil, err
 		}
 	}

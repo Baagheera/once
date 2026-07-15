@@ -889,7 +889,7 @@ func loadOrCreateTokenFile(path string) (string, error) {
 	}
 
 	if dir := filepath.Dir(path); dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
+		if err := once.MkdirAllPrivate(dir); err != nil {
 			return "", err
 		}
 	}
