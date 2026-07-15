@@ -4,6 +4,7 @@ package once
 
 import (
 	"fmt"
+	"runtime"
 
 	"golang.org/x/sys/windows"
 )
@@ -20,18 +21,8 @@ func restrictLocalFile(path string) error {
 		return fmt.Errorf("get token user: %w", err)
 	}
 
-	acl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{
-		{
-			AccessPermissions: windows.GENERIC_ALL,
-			AccessMode:        windows.GRANT_ACCESS,
-			Inheritance:       windows.NO_INHERITANCE,
-			Trustee: windows.TRUSTEE{
-				TrusteeForm:  windows.TRUSTEE_IS_SID,
-				TrusteeType:  windows.TRUSTEE_IS_USER,
-				TrusteeValue: windows.TrusteeValueFromSID(user.User.Sid),
-			},
-		},
-	}, nil)
+	acl, err := privateFileACL(user.User.Sid)
+	runtime.KeepAlive(user)
 	if err != nil {
 		return fmt.Errorf("build acl: %w", err)
 	}
@@ -49,4 +40,23 @@ func restrictLocalFile(path string) error {
 		return fmt.Errorf("set acl: %w", err)
 	}
 	return nil
+}
+
+func privateFileACL(sid *windows.SID) (*windows.ACL, error) {
+	var pinner runtime.Pinner
+	pinner.Pin(sid)
+	defer pinner.Unpin()
+
+	return windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{
+		{
+			AccessPermissions: windows.GENERIC_ALL,
+			AccessMode:        windows.GRANT_ACCESS,
+			Inheritance:       windows.NO_INHERITANCE,
+			Trustee: windows.TRUSTEE{
+				TrusteeForm:  windows.TRUSTEE_IS_SID,
+				TrusteeType:  windows.TRUSTEE_IS_USER,
+				TrusteeValue: windows.TrusteeValueFromSID(sid),
+			},
+		},
+	}, nil)
 }

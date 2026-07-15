@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -98,6 +99,10 @@ func grantWindowsEveryoneAccess(t *testing.T, path string, access windows.ACCESS
 	if err != nil {
 		t.Fatal(err)
 	}
+	var pinner runtime.Pinner
+	pinner.Pin(user.User.Sid)
+	pinner.Pin(everyone)
+	defer pinner.Unpin()
 
 	acl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{
 		{
