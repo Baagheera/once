@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1518,6 +1519,51 @@ VALUES (?, ?, 'running', '[]', ?, ?)
 	}
 }
 
+func TestForEachRecordPreservesListOrderAndStopsOnError(t *testing.T) {
+	store, err := OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	base := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	for _, row := range []struct {
+		key string
+		at  time.Time
+	}{
+		{key: "old", at: base},
+		{key: "new-b", at: base.Add(time.Second)},
+		{key: "new-a", at: base.Add(time.Second)},
+	} {
+		if _, err := store.db.Exec(`
+INSERT INTO once_records (key, attempt_hash, state, command, started_at, updated_at)
+VALUES (?, ?, 'running', '[]', ?, ?)
+`, row.key, row.key+"-attempt", formatTime(row.at), formatTime(row.at)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	stop := errors.New("stop visiting")
+	var keys []string
+	err = store.ForEachRecord(ListOptions{State: Running}, func(rec Record) error {
+		keys = append(keys, rec.Key)
+		if len(keys) == 2 {
+			return stop
+		}
+		return nil
+	})
+	if !errors.Is(err, stop) {
+		t.Fatalf("ForEachRecord error = %v, want %v", err, stop)
+	}
+	want := []string{"new-a", "new-b"}
+	if strings.Join(keys, ",") != strings.Join(want, ",") {
+		t.Fatalf("visited keys = %v, want %v", keys, want)
+	}
+	if err := store.ForEachRecord(ListOptions{}, nil); err == nil {
+		t.Fatal("expected nil visitor error")
+	}
+}
+
 func TestListFiltersByUpdatedBefore(t *testing.T) {
 	store, err := OpenSQLite(t.TempDir() + "/once.db")
 	if err != nil {
@@ -1620,6 +1666,76 @@ VALUES (?, ?, ?, 0, '[]', ?, ?, ?)
 	}
 }
 
+func TestPruneForceCommitsCompletedBatches(t *testing.T) {
+	const completedBatches = 2
+	const completedRecords = pruneBatchSize * completedBatches
+
+	store, err := OpenSQLite(t.TempDir() + "/once.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	base := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	tx, err := store.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt, err := tx.Prepare(`
+INSERT INTO once_records (key, attempt_hash, state, exit_code, command, started_at, finished_at, updated_at)
+VALUES (?, ?, 'succeeded', 0, '[]', ?, ?, ?)
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < completedRecords+2; i++ {
+		key := fmt.Sprintf("row-%04d", i)
+		at := base.Add(time.Duration(i) * time.Nanosecond)
+		if _, err := stmt.Exec(key, key+"-attempt", formatTime(at), formatTime(at), formatTime(at)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	blockedKey := fmt.Sprintf("row-%04d", completedRecords)
+	if _, err := store.db.Exec(fmt.Sprintf(`
+CREATE TRIGGER stop_prune BEFORE DELETE ON once_records
+WHEN OLD.key = '%s'
+BEGIN
+	SELECT RAISE(ABORT, 'stop prune');
+END;
+`, blockedKey)); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := store.Prune(PruneOptions{
+		State:  Succeeded,
+		Cutoff: base.Add(time.Hour),
+		Force:  true,
+	})
+	if err == nil {
+		t.Fatal("expected second prune batch to fail")
+	}
+	if result.Deleted != completedRecords {
+		t.Fatalf("deleted before failure = %d, want %d", result.Deleted, completedRecords)
+	}
+	if _, err := store.Get("row-0000"); err != ErrNotFound {
+		t.Fatalf("first batch was not committed: %v", err)
+	}
+	if _, err := store.Get(blockedKey); err != nil {
+		t.Fatalf("failed batch removed blocked record: %v", err)
+	}
+	lastKey := fmt.Sprintf("row-%04d", completedRecords+1)
+	if _, err := store.Get(lastKey); err != nil {
+		t.Fatalf("failed batch removed later record: %v", err)
+	}
+}
+
 func TestPruneOrdersCandidatesByParsedUpdatedAt(t *testing.T) {
 	store, err := OpenSQLite(t.TempDir() + "/once.db")
 	if err != nil {
@@ -1654,6 +1770,23 @@ VALUES (?, ?, 'succeeded', 0, '[]', ?, ?, ?)
 	want := []string{"older", "old-a", "old-b"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("prune order = %v, want %v", got, want)
+	}
+
+	stop := errors.New("stop visiting")
+	var visited []string
+	err = store.ForEachPruneCandidate(PruneOptions{State: Succeeded, Cutoff: cutoff}, func(rec Record) error {
+		visited = append(visited, rec.Key)
+		if len(visited) == 2 {
+			return stop
+		}
+		return nil
+	})
+	if !errors.Is(err, stop) {
+		t.Fatalf("ForEachPruneCandidate error = %v, want %v", err, stop)
+	}
+	wantVisited := []string{"older", "old-a"}
+	if strings.Join(visited, ",") != strings.Join(wantVisited, ",") {
+		t.Fatalf("visited prune candidates = %v, want %v", visited, wantVisited)
 	}
 }
 

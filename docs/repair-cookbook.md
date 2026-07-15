@@ -121,6 +121,10 @@ once prune --state failed --older-than 30d --force
 
 Durations accept Go duration syntax such as `24h` and day syntax such as `30d`.
 
+Forced prune commits at most 5,000 deletions per batch. If a later batch fails
+or the process is interrupted, earlier batches remain deleted. Inspect another
+dry run, fix the cause, and rerun the same prune command to finish.
+
 ## What not to do
 
 - Do not force-delete `running` records as a blind retry policy.

@@ -66,6 +66,10 @@ default; use `oncehttp.WithMaxResponseBytes` for larger stored output. Use
 remain disabled so credentials and attempt tokens stay bound to the configured
 server.
 
+These HTTP limits are independent of the local `once run` output budget.
+Base64 expands byte fields, so a local record near the 16 MiB CLI default needs
+a larger `WithMaxResponseBytes` value when read through this client.
+
 ## Endpoints
 
 | Method | Path | Purpose |

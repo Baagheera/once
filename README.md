@@ -170,7 +170,7 @@ ASCII letters, digits, `.`, `_`, `:`, `@`, `=`, and `-`, up to 256 bytes.
 
 | Command | Purpose |
 | --- | --- |
-| `once run --key KEY -- COMMAND [ARG...]` | reserve a key, run a command, store and replay its result |
+| `once run --key KEY [--timeout DURATION] [--max-output-bytes N] -- COMMAND [ARG...]` | reserve a key, run a command, store and replay its result |
 | `once status KEY` | print the state for one key |
 | `once get [--include-output] KEY` | print one record as JSON |
 | `once list [--state STATE] [--limit N] [--older-than DURATION]` | list local records for operators |
@@ -200,6 +200,15 @@ also accept day syntax such as `30d`, where a day is 24 hours.
 
 `get` and `export` omit stored stdout and stderr by default. Use
 `--include-output` only when those bytes are safe to handle.
+
+`list` and prune dry-run tables use tab-separated columns; use JSONL `export`
+when another program needs a stable structured format.
+
+`once run` stores at most 16 MiB of combined stdout and stderr by default.
+`--max-output-bytes N` can lower or raise that budget; `0` stores no command
+output. If the combined output exceeds `N`, once keeps up to `N` bytes,
+discards the rest without stopping the command, and commits a `failed` result
+with exit code `125`. A replay returns that stored result unchanged.
 
 ## Exit codes
 
@@ -255,6 +264,10 @@ once prune --state succeeded --older-than 30d --force
 ```
 
 `prune` never deletes `running` records.
+
+Forced prune commits at most 5,000 deletions per batch. If it is interrupted or
+a later batch fails, earlier batches stay deleted. Inspect the remaining dry
+run and rerun the same command to finish the cleanup.
 
 ## Durability, retention, and backups
 
@@ -390,6 +403,10 @@ The client caps successful JSON responses at 16 MiB by default. Use
 follow redirects, so bearer tokens, attempt tokens, and commit bodies stay
 bound to the configured server.
 
+HTTP request and response limits are independent of the local `once run`
+output budget. Base64 expands stored output, so reading a local record near the
+16 MiB default through `oncehttp` requires a larger response limit.
+
 ## Security notes
 
 Treat the SQLite store as sensitive if command arguments, stdout, stderr, error
@@ -409,8 +426,9 @@ For vulnerability reporting and supported versions, see
 ## Current limitations
 
 `once run` buffers stdout and stderr in memory before storing them, so output is
-not streamed live. Use `once run --max-output-bytes N` when a command might
-write too much output to keep.
+not streamed live. The combined default budget is 16 MiB. Raising
+`--max-output-bytes` also raises the amount once may retain in memory and add to
+the database.
 
 `once run` does not pass stdin to the child process.
 
