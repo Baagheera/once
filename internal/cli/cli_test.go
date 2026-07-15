@@ -669,6 +669,33 @@ func TestDoctorReportsUnsupportedSchemaVersion(t *testing.T) {
 	}
 }
 
+func TestDoctorReportsMetadataWithoutSchemaVersion(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "once.db")
+	store, err := once.OpenSQLite(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db := openDoctorTestDB(t, storePath)
+	execDoctorTestSQL(t, db, `DELETE FROM once_meta WHERE key = 'schema_version'`)
+	closeDoctorTestDB(t, db, storePath)
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{"--store", storePath, "doctor"}, &out, &errOut)
+	if code == 0 {
+		t.Fatalf("doctor should fail when sqlite metadata has no schema version:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "sqlite schema: fail") {
+		t.Fatalf("stdout = %q", out.String())
+	}
+	if !strings.Contains(out.String(), "sqlite metadata table is missing schema_version") {
+		t.Fatalf("stdout = %q", out.String())
+	}
+}
+
 func TestDoctorDoesNotCreateMissingStore(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "missing")
 	storePath := filepath.Join(dir, "once.db")
