@@ -43,6 +43,14 @@ func restrictLocalFile(path string) error {
 }
 
 func privateFileACL(sid *windows.SID) (*windows.ACL, error) {
+	return privateACL(sid, windows.NO_INHERITANCE)
+}
+
+func privateDirectoryACL(sid *windows.SID) (*windows.ACL, error) {
+	return privateACL(sid, windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT)
+}
+
+func privateACL(sid *windows.SID, inheritance uint32) (*windows.ACL, error) {
 	var pinner runtime.Pinner
 	pinner.Pin(sid)
 	defer pinner.Unpin()
@@ -51,7 +59,7 @@ func privateFileACL(sid *windows.SID) (*windows.ACL, error) {
 		{
 			AccessPermissions: windows.GENERIC_ALL,
 			AccessMode:        windows.GRANT_ACCESS,
-			Inheritance:       windows.NO_INHERITANCE,
+			Inheritance:       inheritance,
 			Trustee: windows.TRUSTEE{
 				TrusteeForm:  windows.TRUSTEE_IS_SID,
 				TrusteeType:  windows.TRUSTEE_IS_USER,

@@ -73,11 +73,14 @@ The command prints `ok` both times. The side-effect log has one line.
 On Windows PowerShell:
 
 ```powershell
-$tmp = New-Item -ItemType Directory -Path ([System.IO.Path]::GetTempPath()) -Name ("once-" + [guid]::NewGuid())
-once --store "$tmp\once.db" run --key demo -- powershell -NoProfile -Command "Write-Output 'hello'"
-once --store "$tmp\once.db" run --key demo -- powershell -NoProfile -Command "Write-Output 'hello'"
-once --store "$tmp\once.db" list
+$root = Join-Path $env:LOCALAPPDATA ("once-demo-" + [guid]::NewGuid())
+$store = Join-Path $root "once.db"
+once --store $store run --key demo -- powershell -NoProfile -Command "Write-Output 'hello'"
+once --store $store run --key demo -- powershell -NoProfile -Command "Write-Output 'hello'"
+once --store $store list
 ```
+
+When the directory is missing, once creates it with a protected user-only DACL.
 
 Use a store owned by the app or by the user running it:
 

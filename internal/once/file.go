@@ -29,6 +29,10 @@ func RestrictLocalFile(path string) error {
 	return restrictLocalFile(path)
 }
 
+func MkdirAllPrivate(path string) error {
+	return mkdirAllPrivate(path)
+}
+
 func RejectSharedWritableParent(path string) error {
 	return rejectSharedWritableParent(path)
 }
