@@ -53,6 +53,8 @@ func TestRejectSharedWritableParentRejectsBroadDirectoryRights(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			trustee, sid := wellKnownGroupTrustee(t, tt.sidType)
+			pinner := pinSIDs(sid)
+			defer pinner.Unpin()
 			dir := newACLTestDirectory(t, windows.EXPLICIT_ACCESS{
 				AccessPermissions: tt.mask,
 				AccessMode:        windows.GRANT_ACCESS,
@@ -70,6 +72,8 @@ func TestRejectSharedWritableParentRejectsBroadDirectoryRights(t *testing.T) {
 
 func TestRejectSharedWritableParentRejectsBroadInheritedChildRights(t *testing.T) {
 	trustee, sid := wellKnownGroupTrustee(t, windows.WinBuiltinUsersSid)
+	pinner := pinSIDs(sid)
+	defer pinner.Unpin()
 	dir := newACLTestDirectory(t, windows.EXPLICIT_ACCESS{
 		AccessPermissions: windows.FILE_READ_DATA | windows.FILE_WRITE_DATA,
 		AccessMode:        windows.GRANT_ACCESS,
@@ -88,6 +92,8 @@ func TestRejectSharedWritableParentRejectsDangerousCustomSID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	pinner := pinSIDs(sid)
+	defer pinner.Unpin()
 	dir := newACLTestDirectory(t, windows.EXPLICIT_ACCESS{
 		AccessPermissions: windows.FILE_WRITE_DATA,
 		AccessMode:        windows.GRANT_ACCESS,
@@ -109,6 +115,8 @@ func TestRejectSharedWritableParentRejectsUnsafeAncestorAbovePrivateParent(t *te
 	}
 
 	trustee, sid := wellKnownGroupTrustee(t, windows.WinBuiltinUsersSid)
+	pinner := pinSIDs(sid)
+	defer pinner.Unpin()
 	setTestDirectoryDACL(t, ancestor, windows.EXPLICIT_ACCESS{
 		AccessPermissions: testFileDeleteChild,
 		AccessMode:        windows.GRANT_ACCESS,
@@ -130,6 +138,8 @@ func TestRejectSharedWritableParentRejectsUnsafeAncestorBeforeMissingParent(t *t
 	}
 
 	trustee, sid := wellKnownGroupTrustee(t, windows.WinBuiltinUsersSid)
+	pinner := pinSIDs(sid)
+	defer pinner.Unpin()
 	setTestDirectoryDACL(t, ancestor, windows.EXPLICIT_ACCESS{
 		AccessPermissions: testFileDeleteChild,
 		AccessMode:        windows.GRANT_ACCESS,
@@ -152,6 +162,8 @@ func TestRejectSharedWritableParentAllowsCreateRightsOnAncestor(t *testing.T) {
 	}
 
 	trustee, sid := wellKnownGroupTrustee(t, windows.WinBuiltinUsersSid)
+	pinner := pinSIDs(sid)
+	defer pinner.Unpin()
 	setTestDirectoryDACL(t, ancestor, windows.EXPLICIT_ACCESS{
 		AccessPermissions: windows.FILE_APPEND_DATA,
 		AccessMode:        windows.GRANT_ACCESS,
@@ -168,6 +180,8 @@ func TestRejectSharedWritableParentAllowsCreateRightsOnAncestor(t *testing.T) {
 
 func TestRejectSharedWritableParentAllowsHarmlessReadExecuteRights(t *testing.T) {
 	trustee, sid := wellKnownGroupTrustee(t, windows.WinBuiltinUsersSid)
+	pinner := pinSIDs(sid)
+	defer pinner.Unpin()
 	dir := newACLTestDirectory(t, windows.EXPLICIT_ACCESS{
 		AccessPermissions: windows.GENERIC_READ | windows.GENERIC_EXECUTE,
 		AccessMode:        windows.GRANT_ACCESS,
@@ -399,6 +413,8 @@ func protectedTestDirectoryACL(extra []windows.EXPLICIT_ACCESS) (*windows.ACL, [
 		return nil, nil, err
 	}
 	sids := []*windows.SID{userSID, systemSID, adminSID}
+	pinner := pinSIDs(sids...)
+	defer pinner.Unpin()
 	entries := make([]windows.EXPLICIT_ACCESS, 0, len(sids)+len(extra))
 	for i, sid := range sids {
 		trusteeType := windows.TRUSTEE_TYPE(windows.TRUSTEE_IS_WELL_KNOWN_GROUP)
@@ -442,6 +458,14 @@ func sidTrustee(sid *windows.SID, trusteeType windows.TRUSTEE_TYPE) windows.TRUS
 		TrusteeType:  trusteeType,
 		TrusteeValue: windows.TrusteeValueFromSID(sid),
 	}
+}
+
+func pinSIDs(sids ...*windows.SID) *runtime.Pinner {
+	pinner := new(runtime.Pinner)
+	for _, sid := range sids {
+		pinner.Pin(sid)
+	}
+	return pinner
 }
 
 func testSecurityDescriptor(t *testing.T, aceSDDL string) *windows.SECURITY_DESCRIPTOR {

@@ -52,6 +52,10 @@ func newPrivateTempRoot() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("get token user: %w", err)
 	}
+	var pinner runtime.Pinner
+	pinner.Pin(user.User.Sid)
+	defer pinner.Unpin()
+
 	acl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{
 		{
 			AccessPermissions: windows.GENERIC_ALL,
