@@ -125,6 +125,14 @@ func (h *Handler) commit(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if err := once.ValidateAttemptToken(req.AttemptToken); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid commit")
+		return
+	}
+	if req.State != once.Succeeded && req.State != once.Failed {
+		writeError(w, http.StatusBadRequest, "invalid commit")
+		return
+	}
 
 	rec, err := h.store.Commit(key, req.AttemptToken, req.State, req.ExitCode, req.StdoutB64, req.StderrB64, req.Error)
 	if errors.Is(err, once.ErrNotFound) {
@@ -136,7 +144,7 @@ func (h *Handler) commit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid commit")
+		writeInternal(w)
 		return
 	}
 
@@ -174,13 +182,17 @@ func (h *Handler) forget(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "delete requires X-Once-Attempt-Token")
 		return
 	}
+	if err := once.ValidateAttemptToken(attempt); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid delete")
+		return
+	}
 	deleted, err := h.store.Forget(key, force, attempt)
 	if errors.Is(err, once.ErrRunning) {
 		writeError(w, http.StatusConflict, "key is still running")
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid delete")
+		writeInternal(w)
 		return
 	}
 	if !deleted {

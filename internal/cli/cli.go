@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -11,10 +12,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -187,6 +190,20 @@ func serveCommand(args []string, storePath string, stdout, stderr io.Writer) int
 		return 2
 	}
 
+	srv := &http.Server{
+		Addr:              *listen,
+		Handler:           server.NewHandler(store, server.Options{AuthToken: authToken}),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	listener, err := net.Listen("tcp", *listen)
+	if err != nil {
+		fmt.Fprintf(stderr, "once: serve: %v\n", err)
+		return 1
+	}
+
 	fmt.Fprintf(stdout, "once: listening on %s\n", *listen)
 	if authToken != "" {
 		if authTokenFile != "" {
@@ -198,19 +215,48 @@ func serveCommand(args []string, storePath string, stdout, stderr io.Writer) int
 		fmt.Fprintln(stdout, "once: warning: HTTP auth disabled")
 	}
 
-	srv := &http.Server{
-		Addr:              *listen,
-		Handler:           server.NewHandler(store, server.Options{AuthToken: authToken}),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}
-	if err := srv.ListenAndServe(); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := serveHTTP(ctx, srv, listener); err != nil {
 		fmt.Fprintf(stderr, "once: serve: %v\n", err)
 		return 1
 	}
 	return 0
+}
+
+func serveHTTP(ctx context.Context, srv *http.Server, listener net.Listener) error {
+	serveResult := make(chan error, 1)
+	go func() {
+		serveResult <- srv.Serve(listener)
+	}()
+
+	select {
+	case err := <-serveResult:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownErr := srv.Shutdown(shutdownCtx)
+	cancel()
+	if shutdownErr != nil {
+		_ = srv.Close()
+	}
+
+	serveErr := <-serveResult
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		if shutdownErr != nil {
+			return fmt.Errorf("shutdown: %v; serve: %w", shutdownErr, serveErr)
+		}
+		return serveErr
+	}
+	if shutdownErr != nil {
+		return fmt.Errorf("shutdown: %w", shutdownErr)
+	}
+	return nil
 }
 
 func statusCommand(args []string, storePath string, stdout, stderr io.Writer) int {

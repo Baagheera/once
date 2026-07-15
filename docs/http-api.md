@@ -61,7 +61,10 @@ return err
 
 The client is a wrapper around the HTTP API. It does not execute commands or
 open the SQLite store directly. It caps successful JSON responses at 16 MiB by
-default; use `oncehttp.WithMaxResponseBytes` for larger stored output.
+default; use `oncehttp.WithMaxResponseBytes` for larger stored output. Use
+`oncehttp.WithHTTPClient` to supply transport or timeout settings. Redirects
+remain disabled so credentials and attempt tokens stay bound to the configured
+server.
 
 ## Endpoints
 

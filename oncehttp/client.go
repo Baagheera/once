@@ -93,6 +93,19 @@ func WithBearerToken(token string) Option {
 	}
 }
 
+// WithHTTPClient configures the underlying HTTP client. The client is copied,
+// and redirects remain disabled so credentials and attempt tokens stay bound
+// to the configured once server.
+func WithHTTPClient(client *http.Client) Option {
+	return func(c *Client) error {
+		if client == nil {
+			return fmt.Errorf("nil http client")
+		}
+		c.client = client
+		return nil
+	}
+}
+
 // WithMaxResponseBytes sets the maximum successful JSON response size.
 func WithMaxResponseBytes(n int64) Option {
 	return func(c *Client) error {
@@ -129,7 +142,16 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 			return nil, err
 		}
 	}
+	c.client = cloneHTTPClient(c.client)
 	return c, nil
+}
+
+func cloneHTTPClient(client *http.Client) *http.Client {
+	clone := *client
+	clone.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &clone
 }
 
 // Reserve reserves a key or returns the existing record.

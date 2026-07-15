@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,153 @@ import (
 
 	once "github.com/Baagheera/once/internal/once"
 )
+
+type fakeStore struct {
+	err   error
+	calls int
+}
+
+func (s *fakeStore) Close() error {
+	return nil
+}
+
+func (s *fakeStore) Reserve(string, []string) (once.Record, bool, error) {
+	s.calls++
+	return once.Record{}, false, s.err
+}
+
+func (s *fakeStore) Commit(string, string, once.State, int, []byte, []byte, string) (once.Record, error) {
+	s.calls++
+	return once.Record{}, s.err
+}
+
+func (s *fakeStore) Get(string) (once.Record, error) {
+	s.calls++
+	return once.Record{}, s.err
+}
+
+func (s *fakeStore) Forget(string, bool, string) (bool, error) {
+	s.calls++
+	return false, s.err
+}
+
+func TestStoreErrorsReturnInternalError(t *testing.T) {
+	attempt, err := once.NewAttemptToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name    string
+		method  string
+		path    string
+		body    string
+		attempt string
+	}{
+		{
+			name:   "reserve",
+			method: http.MethodPost,
+			path:   "/v1/reserve",
+			body:   `{"key":"demo"}`,
+		},
+		{
+			name:   "commit",
+			method: http.MethodPost,
+			path:   "/v1/commit",
+			body:   `{"key":"demo","attempt_token":"` + attempt + `","state":"succeeded","exit_code":0}`,
+		},
+		{
+			name:   "get",
+			method: http.MethodGet,
+			path:   "/v1/records/demo",
+		},
+		{
+			name:    "delete",
+			method:  http.MethodDelete,
+			path:    "/v1/records/demo",
+			attempt: attempt,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &fakeStore{err: errors.New("sentinel store error")}
+			handler := NewHandler(store, Options{AuthToken: "test-token"})
+
+			var res *httptest.ResponseRecorder
+			if tt.attempt == "" {
+				res = request(t, handler, tt.method, tt.path, tt.body)
+			} else {
+				res = requestWithAttempt(t, handler, tt.method, tt.path, tt.body, tt.attempt)
+			}
+
+			if res.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+			}
+			if got := strings.TrimSpace(res.Body.String()); got != `{"error":"internal error"}` {
+				t.Fatalf("body = %s", res.Body.String())
+			}
+			if store.calls != 1 {
+				t.Fatalf("store calls = %d, want 1", store.calls)
+			}
+		})
+	}
+}
+
+func TestRejectsInvalidStoreArgumentsBeforeCallingStore(t *testing.T) {
+	attempt, err := once.NewAttemptToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name    string
+		method  string
+		path    string
+		body    string
+		attempt string
+	}{
+		{
+			name:   "malformed commit attempt token",
+			method: http.MethodPost,
+			path:   "/v1/commit",
+			body:   `{"key":"demo","attempt_token":"%","state":"succeeded","exit_code":0}`,
+		},
+		{
+			name:   "non-terminal commit state",
+			method: http.MethodPost,
+			path:   "/v1/commit",
+			body:   `{"key":"demo","attempt_token":"` + attempt + `","state":"running","exit_code":0}`,
+		},
+		{
+			name:    "malformed delete attempt token",
+			method:  http.MethodDelete,
+			path:    "/v1/records/demo",
+			attempt: "%",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &fakeStore{err: errors.New("store should not be called")}
+			handler := NewHandler(store, Options{AuthToken: "test-token"})
+
+			var res *httptest.ResponseRecorder
+			if tt.attempt == "" {
+				res = request(t, handler, tt.method, tt.path, tt.body)
+			} else {
+				res = requestWithAttempt(t, handler, tt.method, tt.path, tt.body, tt.attempt)
+			}
+
+			if res.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+			}
+			if store.calls != 0 {
+				t.Fatalf("store calls = %d, want 0", store.calls)
+			}
+		})
+	}
+}
 
 func TestReserveCommitAndGet(t *testing.T) {
 	handler := newTestHandler(t)

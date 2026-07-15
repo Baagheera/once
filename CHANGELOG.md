@@ -4,6 +4,18 @@ User-facing changes are recorded here as releases are prepared.
 
 ## Unreleased
 
+### Security
+
+- The Go HTTP client no longer follows redirects, keeping bearer tokens,
+  attempt tokens, and commit bodies bound to the configured server.
+
+### Changed
+
+- Unexpected store failures now return a generic HTTP 500 response instead of
+  being reported as invalid commit or delete requests.
+- `once serve` binds before announcing its listener and drains active requests
+  on process shutdown.
+
 ## v0.6.1 - 2026-07-15
 
 ### Security
