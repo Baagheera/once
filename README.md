@@ -28,6 +28,7 @@ so the uncertainty is visible.
 - [Commands](#commands)
 - [Exit codes](#exit-codes)
 - [Inspect and repair](#inspect-and-repair)
+- [Durability, retention, and backups](#durability-retention-and-backups)
 - [HTTP mode](#http-mode)
 - [Go HTTP client](#go-http-client)
 - [Security notes](#security-notes)
@@ -251,6 +252,36 @@ once prune --state succeeded --older-than 30d --force
 ```
 
 `prune` never deletes `running` records.
+
+## Durability, retention, and backups
+
+Keep the store on a local filesystem. once opens SQLite in WAL mode and
+requires `synchronous=FULL`; it verifies both settings before using the store.
+These settings protect the log within SQLite and filesystem guarantees. They
+do not make the external side effect atomic with the commit.
+
+An idempotency key protects a side effect only while its record remains in the
+active store. `forget`, forced `prune`, or restoring an older snapshot can make
+the same key fresh again. Keep records longer than the longest period in which
+a request can be retried or a key can be reused, and inspect a prune dry run
+before deleting anything.
+
+A live WAL database is not just its `.db` file. Copying that file by itself can
+miss committed data. For a simple file backup, every SQLite user must close the
+store cleanly and remain stopped while it is copied. If a `-wal` file remains,
+it is part of the database state and must stay paired with that exact `.db`.
+If users cannot remain stopped, or the database and WAL cannot be preserved as
+a matched set, use SQLite's online backup mechanism.
+
+Restore only while every SQLite user remains stopped. Replace or remove the old
+`.db`, `-wal`, `-shm`, and `-journal` files as one controlled set so journals
+from different points in time are never mixed. Use a once version that supports
+the stored schema, preserve restrictive permissions, and keep the HTTP token
+file when one is in use.
+
+After restoring an older snapshot, reconcile external effects newer than that
+snapshot before allowing retries. once does not automate retention, backup,
+restore, leases, or takeover.
 
 ## HTTP mode
 

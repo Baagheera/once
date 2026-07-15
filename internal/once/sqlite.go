@@ -13,16 +13,69 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 type SQLiteStore struct {
 	db *sql.DB
 }
 
-const sqliteSchemaVersion = "1"
+type sqliteMetadataState uint8
+
+const (
+	sqliteMetadataAbsent sqliteMetadataState = iota
+	sqliteMetadataVersionMissing
+	sqliteMetadataVersionPresent
+)
+
+type sqliteSchemaVersionMissingError struct{}
+
+func (sqliteSchemaVersionMissingError) Error() string {
+	return "sqlite metadata table is missing schema_version"
+}
+
+func (sqliteSchemaVersionMissingError) sqliteSchemaVersionMissing() {}
+
+var errSQLiteSchemaVersionMissing = sqliteSchemaVersionMissingError{}
+
+const (
+	sqliteSchemaVersion   = "1"
+	sqliteDriverName      = "github.com/Baagheera/once/sqlite"
+	sqliteBusyTimeoutMS   = 5000
+	sqliteSynchronousFull = 2
+)
+
+type sqliteInitOptions struct {
+	afterMissingMetadataRead     func()
+	afterMigrationLock           func()
+	afterWALTransitionContention func()
+	migrationBusyTimeoutMS       int
+}
+
+func init() {
+	driver := &sqlite.Driver{}
+	driver.RegisterConnectionHook(func(conn sqlite.ExecQuerierContext, _ string) error {
+		ctx := context.Background()
+		for _, pragma := range []string{
+			"PRAGMA busy_timeout = 5000",
+			"PRAGMA synchronous = FULL",
+			"PRAGMA foreign_keys = ON",
+		} {
+			if _, err := conn.ExecContext(ctx, pragma, nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	sql.Register(sqliteDriverName, driver)
+}
 
 func OpenSQLite(path string) (*SQLiteStore, error) {
+	return openSQLite(path, sqliteInitOptions{})
+}
+
+func openSQLite(path string, options sqliteInitOptions) (*SQLiteStore, error) {
 	if path == "" {
 		return nil, fmt.Errorf("empty sqlite path")
 	}
@@ -59,14 +112,14 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 		return nil, err
 	}
 
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open(sqliteDriverName, path)
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
 
 	s := &SQLiteStore{db: db}
-	if err := s.init(); err != nil {
+	if err := s.init(options); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -91,46 +144,88 @@ func (s *SQLiteStore) Close() error {
 	return s.db.Close()
 }
 
-func (s *SQLiteStore) init() error {
-	if err := s.rejectUnsupportedSchemaVersion(); err != nil {
-		return err
-	}
-
-	pragmas := []string{
-		"PRAGMA journal_mode = WAL",
-		"PRAGMA busy_timeout = 5000",
-		"PRAGMA foreign_keys = ON",
-	}
-	for _, pragma := range pragmas {
-		if _, err := s.db.Exec(pragma); err != nil {
-			return err
-		}
-	}
-
-	_, err := s.db.Exec(`
-CREATE TABLE IF NOT EXISTS once_records (
-	key TEXT PRIMARY KEY,
-	attempt_hash TEXT NOT NULL DEFAULT '',
-	state TEXT NOT NULL CHECK (state IN ('running', 'succeeded', 'failed')),
-	exit_code INTEGER NOT NULL DEFAULT 0,
-	stdout BLOB NOT NULL DEFAULT X'',
-	stderr BLOB NOT NULL DEFAULT X'',
-	error TEXT NOT NULL DEFAULT '',
-	command TEXT NOT NULL DEFAULT '[]',
-	started_at TEXT NOT NULL,
-	finished_at TEXT,
-	updated_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS once_records_state_idx ON once_records(state);
-`)
+func (s *SQLiteStore) init(options sqliteInitOptions) error {
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return err
 	}
-	if err := s.ensureColumn("once_records", "attempt_hash", "ALTER TABLE once_records ADD COLUMN attempt_hash TEXT NOT NULL DEFAULT ''"); err != nil {
+	defer conn.Close()
+
+	metadataState, version, err := readSQLiteSchemaVersion(ctx, conn)
+	if err != nil {
 		return err
 	}
-	return s.ensureSchemaVersion()
+	switch metadataState {
+	case sqliteMetadataVersionMissing:
+		return errSQLiteSchemaVersionMissing
+	case sqliteMetadataVersionPresent:
+		if err := CheckSQLiteSchemaVersion(version); err != nil {
+			return err
+		}
+		return configureSQLiteConnection(ctx, conn, options.afterWALTransitionContention)
+	}
+
+	if options.afterMissingMetadataRead != nil {
+		options.afterMissingMetadataRead()
+	}
+	if options.migrationBusyTimeoutMS > 0 {
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", options.migrationBusyTimeoutMS)); err != nil {
+			return err
+		}
+	}
+	if err := configureSQLiteDurability(ctx, conn, options.afterWALTransitionContention); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
+	if options.afterMigrationLock != nil {
+		options.afterMigrationLock()
+	}
+
+	metadataState, version, err = readSQLiteSchemaVersion(ctx, conn)
+	if err != nil {
+		return err
+	}
+	switch metadataState {
+	case sqliteMetadataAbsent:
+		if err := initializeSQLiteSchema(ctx, conn); err != nil {
+			return err
+		}
+		metadataState, version, err = readSQLiteSchemaVersion(ctx, conn)
+		if err != nil {
+			return err
+		}
+		if metadataState == sqliteMetadataVersionMissing {
+			return errSQLiteSchemaVersionMissing
+		}
+		if metadataState != sqliteMetadataVersionPresent {
+			return fmt.Errorf("sqlite schema version is missing after initialization")
+		}
+	case sqliteMetadataVersionMissing:
+		return errSQLiteSchemaVersionMissing
+	}
+	if err := CheckSQLiteSchemaVersion(version); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return err
+	}
+	committed = true
+
+	if options.migrationBusyTimeoutMS > 0 {
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", sqliteBusyTimeoutMS)); err != nil {
+			return err
+		}
+	}
+	return configureSQLiteConnection(ctx, conn, options.afterWALTransitionContention)
 }
 
 func (s *SQLiteStore) Reserve(key string, command []string) (Record, bool, error) {
@@ -590,20 +685,69 @@ func scanRecord(scanner recordScanner) (Record, error) {
 }
 
 func restrictSQLiteFiles(path string) error {
-	for _, name := range sqliteFilePaths(path) {
-		if err := RejectSymlinkPath(name); err != nil {
+	for i, name := range sqliteFilePaths(path) {
+		allowMissing := i > 0
+		if err := restrictSQLiteFile(name, allowMissing); err != nil {
+			return fmt.Errorf("restrict sqlite file %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func restrictSQLiteFile(name string, allowMissing bool) error {
+	const (
+		initialDelay = 5 * time.Millisecond
+		maximumDelay = 100 * time.Millisecond
+	)
+	err := restrictSQLiteFileOnce(name, allowMissing)
+	if err == nil || !allowMissing || !errors.Is(err, os.ErrPermission) {
+		return err
+	}
+
+	// SQLite can temporarily deny metadata access to a live sidecar on Windows.
+	deadline := time.Now().Add(time.Duration(sqliteBusyTimeoutMS) * time.Millisecond)
+	delay := initialDelay
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			return err
 		}
-		if info, err := os.Stat(name); err == nil {
-			if !info.Mode().IsRegular() {
-				return fmt.Errorf("sqlite path must be a regular file: %s", name)
-			}
-			if err := RestrictLocalFile(name); err != nil {
-				return err
-			}
-		} else if !errors.Is(err, os.ErrNotExist) {
+		if delay > remaining {
+			delay = remaining
+		}
+		time.Sleep(delay)
+		err = restrictSQLiteFileOnce(name, allowMissing)
+		if err == nil || !errors.Is(err, os.ErrPermission) {
 			return err
 		}
+		if delay < maximumDelay {
+			delay *= 2
+			if delay > maximumDelay {
+				delay = maximumDelay
+			}
+		}
+	}
+}
+
+func restrictSQLiteFileOnce(name string, allowMissing bool) error {
+	if err := RejectSymlinkPath(name); err != nil {
+		return err
+	}
+	info, err := os.Stat(name)
+	if err != nil {
+		if allowMissing && errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("sqlite path must be a regular file: %s", name)
+	}
+	if err := RestrictLocalFile(name); err != nil {
+		if allowMissing && errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
 	}
 	return nil
 }
@@ -618,16 +762,73 @@ func rejectSQLiteFileSymlinks(path string) error {
 }
 
 func sqliteFilePaths(path string) []string {
-	return []string{path, path + "-wal", path + "-shm"}
+	return []string{path, path + "-wal", path + "-shm", path + "-journal"}
 }
 
-func (s *SQLiteStore) ensureColumn(table, column, ddl string) error {
-	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
+func readSQLiteSchemaVersion(ctx context.Context, conn *sql.Conn) (sqliteMetadataState, string, error) {
+	var exists int
+	if err := conn.QueryRowContext(ctx, `SELECT EXISTS (
+	SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'once_meta'
+)`).Scan(&exists); err != nil {
+		return 0, "", err
+	}
+	if exists == 0 {
+		return sqliteMetadataAbsent, "", nil
+	}
+
+	var version string
+	err := conn.QueryRowContext(ctx, `SELECT value FROM once_meta WHERE key = 'schema_version'`).Scan(&version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return sqliteMetadataVersionMissing, "", nil
+	}
+	if err != nil {
+		return 0, "", err
+	}
+	return sqliteMetadataVersionPresent, version, nil
+}
+
+func initializeSQLiteSchema(ctx context.Context, conn *sql.Conn) error {
+	if _, err := conn.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS once_records (
+	key TEXT PRIMARY KEY,
+	attempt_hash TEXT NOT NULL DEFAULT '',
+	state TEXT NOT NULL CHECK (state IN ('running', 'succeeded', 'failed')),
+	exit_code INTEGER NOT NULL DEFAULT 0,
+	stdout BLOB NOT NULL DEFAULT X'',
+	stderr BLOB NOT NULL DEFAULT X'',
+	error TEXT NOT NULL DEFAULT '',
+	command TEXT NOT NULL DEFAULT '[]',
+	started_at TEXT NOT NULL,
+	finished_at TEXT,
+	updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS once_records_state_idx ON once_records(state);
+`); err != nil {
+		return err
+	}
+	if err := ensureSQLiteColumn(ctx, conn, "once_records", "attempt_hash", "ALTER TABLE once_records ADD COLUMN attempt_hash TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS once_meta (
+	key TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+);
+`); err != nil {
+		return err
+	}
+	_, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO once_meta (key, value) VALUES ('schema_version', ?)`, sqliteSchemaVersion)
+	return err
+}
+
+func ensureSQLiteColumn(ctx context.Context, conn *sql.Conn, table, column, ddl string) error {
+	rows, err := conn.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
 
+	found := false
 	for rows.Next() {
 		var cid int
 		var name string
@@ -636,72 +837,131 @@ func (s *SQLiteStore) ensureColumn(table, column, ddl string) error {
 		var defaultValue any
 		var pk int
 		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			_ = rows.Close()
 			return err
 		}
 		if name == column {
-			return rows.Err()
+			found = true
 		}
 	}
 	if err := rows.Err(); err != nil {
+		_ = rows.Close()
 		return err
 	}
-	_, err = s.db.Exec(ddl)
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	_, err = conn.ExecContext(ctx, ddl)
 	return err
 }
 
-func (s *SQLiteStore) rejectUnsupportedSchemaVersion() error {
-	exists, err := s.tableExists("once_meta")
-	if err != nil {
+func configureSQLiteDurability(ctx context.Context, conn *sql.Conn, afterWALTransitionContention func()) error {
+	var journalMode string
+	if err := conn.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&journalMode); err != nil {
 		return err
 	}
-	if !exists {
-		return nil
+	if !strings.EqualFold(journalMode, "wal") {
+		if err := transitionSQLiteJournalModeToWAL(ctx, conn, afterWALTransitionContention); err != nil {
+			return err
+		}
 	}
-
-	var version string
-	err = s.db.QueryRow(`SELECT value FROM once_meta WHERE key = 'schema_version'`).Scan(&version)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
+	if _, err := conn.ExecContext(ctx, "PRAGMA synchronous = FULL"); err != nil {
 		return err
 	}
-
-	return CheckSQLiteSchemaVersion(version)
-}
-
-func (s *SQLiteStore) ensureSchemaVersion() error {
-	if _, err := s.db.Exec(`
-CREATE TABLE IF NOT EXISTS once_meta (
-	key TEXT PRIMARY KEY,
-	value TEXT NOT NULL
-);
-`); err != nil {
+	var synchronous int
+	if err := conn.QueryRowContext(ctx, "PRAGMA synchronous").Scan(&synchronous); err != nil {
 		return err
 	}
-
-	var version string
-	err := s.db.QueryRow(`SELECT value FROM once_meta WHERE key = 'schema_version'`).Scan(&version)
-	if errors.Is(err, sql.ErrNoRows) {
-		_, err = s.db.Exec(`INSERT INTO once_meta (key, value) VALUES ('schema_version', ?)`, sqliteSchemaVersion)
-		return err
-	}
-	if err != nil {
-		return err
-	}
-
-	if err := CheckSQLiteSchemaVersion(version); err != nil {
-		return err
+	if synchronous != sqliteSynchronousFull {
+		return fmt.Errorf("sqlite synchronous = %d, want %d", synchronous, sqliteSynchronousFull)
 	}
 	return nil
 }
 
-func (s *SQLiteStore) tableExists(name string) (bool, error) {
-	var count int
-	if err := s.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, name).Scan(&count); err != nil {
-		return false, err
+func transitionSQLiteJournalModeToWAL(ctx context.Context, conn *sql.Conn, afterContention func()) error {
+	retryCtx, cancel := context.WithTimeout(ctx, time.Duration(sqliteBusyTimeoutMS)*time.Millisecond)
+	defer cancel()
+
+	const (
+		initialDelay = 5 * time.Millisecond
+		maximumDelay = 100 * time.Millisecond
+	)
+	delay := initialDelay
+	var lastErr error
+	contentionReported := false
+	for {
+		var journalMode string
+		err := conn.QueryRowContext(retryCtx, "PRAGMA journal_mode = WAL").Scan(&journalMode)
+		switch {
+		case err == nil && strings.EqualFold(journalMode, "wal"):
+			return nil
+		case err == nil:
+			lastErr = fmt.Errorf("sqlite journal mode = %q, want wal", journalMode)
+		case !isSQLiteLockContention(err):
+			return err
+		default:
+			lastErr = err
+		}
+		if !contentionReported && afterContention != nil {
+			contentionReported = true
+			afterContention()
+		}
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-retryCtx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return fmt.Errorf("sqlite journal mode did not become wal (%v): %w", lastErr, retryCtx.Err())
+		case <-timer.C:
+		}
+		if delay < maximumDelay {
+			delay *= 2
+			if delay > maximumDelay {
+				delay = maximumDelay
+			}
+		}
 	}
-	return count > 0, nil
+}
+
+func isSQLiteLockContention(err error) bool {
+	var sqliteErr *sqlite.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	baseCode := sqliteErr.Code() & 0xff
+	return baseCode == sqlite3.SQLITE_BUSY || baseCode == sqlite3.SQLITE_LOCKED
+}
+
+func configureSQLiteConnection(ctx context.Context, conn *sql.Conn, afterWALTransitionContention func()) error {
+	if err := configureSQLiteDurability(ctx, conn, afterWALTransitionContention); err != nil {
+		return err
+	}
+
+	for _, check := range []struct {
+		name  string
+		query string
+		want  int
+	}{
+		{name: "busy timeout", query: "PRAGMA busy_timeout", want: sqliteBusyTimeoutMS},
+		{name: "foreign keys", query: "PRAGMA foreign_keys", want: 1},
+	} {
+		var got int
+		if err := conn.QueryRowContext(ctx, check.query).Scan(&got); err != nil {
+			return err
+		}
+		if got != check.want {
+			return fmt.Errorf("sqlite %s = %d, want %d", check.name, got, check.want)
+		}
+	}
+	return nil
 }
 
 // CheckSQLiteSchemaVersion rejects stores that need a different once binary.
