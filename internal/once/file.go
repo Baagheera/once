@@ -48,6 +48,9 @@ func pathPrefixes(path string) []string {
 	} else if volume != "" {
 		current = volume
 		prefixes = append(prefixes, current)
+	} else {
+		current = "."
+		prefixes = append(prefixes, current)
 	}
 
 	for _, part := range strings.Split(rest, separator) {

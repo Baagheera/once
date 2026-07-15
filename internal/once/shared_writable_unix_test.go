@@ -75,6 +75,37 @@ func TestRejectSharedWritableParentRejectsGroupWritableAncestor(t *testing.T) {
 	}
 }
 
+func TestRejectSharedWritableParentRejectsSharedCurrentDirectory(t *testing.T) {
+	original, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(original); err != nil {
+			t.Errorf("restore working directory: %v", err)
+		}
+	})
+
+	shared := filepath.Join(t.TempDir(), "shared")
+	private := filepath.Join(shared, "private")
+	if err := os.Mkdir(shared, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(private, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shared, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(shared); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RejectSharedWritableParent(filepath.Join("private", "once.db")); err == nil {
+		t.Fatal("expected shared current directory to be rejected")
+	}
+}
+
 func TestRejectSharedWritableParentAllowsStickyWritableAncestorAbovePrivateParent(t *testing.T) {
 	shared := filepath.Join(t.TempDir(), "shared")
 	private := filepath.Join(shared, "private")

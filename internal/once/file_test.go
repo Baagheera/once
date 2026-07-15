@@ -3,9 +3,17 @@ package once
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"testing"
 )
+
+func TestPathPrefixesRelativeIncludesCurrentDirectory(t *testing.T) {
+	want := []string{".", "nested", filepath.Join("nested", "private")}
+	if got := pathPrefixes(filepath.Join("nested", "private")); !reflect.DeepEqual(got, want) {
+		t.Fatalf("pathPrefixes() = %q, want %q", got, want)
+	}
+}
 
 func TestRejectSymlinkPathRejectsNestedAncestor(t *testing.T) {
 	if runtime.GOOS == "windows" {
