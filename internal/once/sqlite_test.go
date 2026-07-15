@@ -3,6 +3,8 @@ package once
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -298,51 +300,14 @@ func TestForceForgetRejectsWrongAttempt(t *testing.T) {
 
 func TestOpenSQLiteMigratesMissingAttemptHash(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "once.db")
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now().UTC()
-	if _, err := db.Exec(`
-CREATE TABLE once_records (
-	key TEXT PRIMARY KEY,
-	state TEXT NOT NULL CHECK (state IN ('running', 'succeeded', 'failed')),
-	exit_code INTEGER NOT NULL DEFAULT 0,
-	stdout BLOB NOT NULL DEFAULT X'',
-	stderr BLOB NOT NULL DEFAULT X'',
-	error TEXT NOT NULL DEFAULT '',
-	command TEXT NOT NULL DEFAULT '[]',
-	started_at TEXT NOT NULL,
-	finished_at TEXT,
-	updated_at TEXT NOT NULL
-);
-CREATE INDEX once_records_state_idx ON once_records(state);
-INSERT INTO once_records (key, state, command, started_at, updated_at)
-VALUES ('legacy', 'running', '["old"]', ?, ?);
-`, formatTime(now), formatTime(now)); err != nil {
-		_ = db.Close()
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := RestrictLocalFile(path); err != nil {
-		t.Fatal(err)
-	}
+	createLegacySQLiteStore(t, path)
 
 	store, err := OpenSQLite(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-
-	var columnCount int
-	if err := store.db.QueryRow(`SELECT count(*) FROM pragma_table_info('once_records') WHERE name = 'attempt_hash'`).Scan(&columnCount); err != nil {
-		t.Fatal(err)
-	}
-	if columnCount != 1 {
-		t.Fatalf("attempt_hash column count = %d, want 1", columnCount)
-	}
+	assertSQLiteMigrationStamped(t, store.db)
 
 	rec, err := store.Get("legacy")
 	if err != nil {
@@ -354,14 +319,186 @@ VALUES ('legacy', 'running', '["old"]', ?, ?);
 	if rec.State != Running || len(rec.Command) != 1 || rec.Command[0] != "old" {
 		t.Fatalf("legacy record = %#v", rec)
 	}
+}
 
-	var version string
-	if err := store.db.QueryRow(`SELECT value FROM once_meta WHERE key = 'schema_version'`).Scan(&version); err != nil {
+func TestOpenSQLiteSerializesConcurrentLegacyMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "once.db")
+	createLegacySQLiteStore(t, path)
+
+	firstLocked := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstReleased := false
+	defer func() {
+		if !firstReleased {
+			close(releaseFirst)
+		}
+	}()
+	secondSawMissing := make(chan struct{})
+	secondLocked := make(chan struct{})
+
+	firstResult := make(chan sqliteOpenResult, 1)
+	secondResult := make(chan sqliteOpenResult, 1)
+
+	go func() {
+		store, err := openSQLite(path, sqliteInitOptions{
+			afterMigrationLock: func() {
+				close(firstLocked)
+				<-releaseFirst
+			},
+		})
+		firstResult <- sqliteOpenResult{store: store, err: err}
+	}()
+	waitSQLiteTestSignal(t, firstLocked, "first opener to acquire migration lock")
+
+	go func() {
+		store, err := openSQLite(path, sqliteInitOptions{
+			afterMissingVersionRead: func() {
+				close(secondSawMissing)
+			},
+			afterMigrationLock: func() {
+				close(secondLocked)
+			},
+		})
+		secondResult <- sqliteOpenResult{store: store, err: err}
+	}()
+	waitSQLiteTestSignal(t, secondSawMissing, "second opener to observe missing metadata")
+	close(releaseFirst)
+	firstReleased = true
+	waitSQLiteTestSignal(t, secondLocked, "second opener to acquire migration lock")
+
+	var stores []*SQLiteStore
+	for i, resultCh := range []<-chan sqliteOpenResult{firstResult, secondResult} {
+		result := waitSQLiteOpenResult(t, resultCh)
+		if result.err != nil {
+			t.Fatalf("opener %d: %v", i+1, result.err)
+		}
+		defer result.store.Close()
+		stores = append(stores, result.store)
+	}
+	assertSQLiteMigrationStamped(t, stores[0].db)
+}
+
+func TestOpenSQLiteLockedLegacyMigrationIsAtomic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "once.db")
+	createLegacySQLiteStore(t, path)
+
+	locker, err := sql.Open("sqlite", path)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if version != sqliteSchemaVersion {
-		t.Fatalf("schema version = %q, want %q", version, sqliteSchemaVersion)
+	defer locker.Close()
+	locker.SetMaxOpenConns(1)
+	ctx := context.Background()
+	conn, err := locker.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer conn.Close()
+	var journalMode string
+	if err := conn.QueryRowContext(ctx, "PRAGMA journal_mode = WAL").Scan(&journalMode); err != nil {
+		t.Fatal(err)
+	}
+	if journalMode != "wal" {
+		t.Fatalf("journal_mode = %q, want wal", journalMode)
+	}
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	locked := true
+	defer func() {
+		if locked {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
+
+	store, err := openSQLite(path, sqliteInitOptions{migrationBusyTimeoutMS: 1})
+	if err == nil {
+		_ = store.Close()
+		t.Fatal("openSQLite succeeded while legacy migration was locked")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "locked") {
+		t.Fatalf("openSQLite err = %v, want locked database error", err)
+	}
+
+	var metaCount int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'once_meta'`).Scan(&metaCount); err != nil {
+		t.Fatal(err)
+	}
+	if metaCount != 0 {
+		t.Fatalf("once_meta table count = %d, want 0", metaCount)
+	}
+	var columnCount int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('once_records') WHERE name = 'attempt_hash'`).Scan(&columnCount); err != nil {
+		t.Fatal(err)
+	}
+	if columnCount != 0 {
+		t.Fatalf("attempt_hash column count = %d, want 0", columnCount)
+	}
+
+	if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+		t.Fatal(err)
+	}
+	locked = false
+
+	store, err = OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	assertSQLiteMigrationStamped(t, store.db)
+}
+
+func TestOpenSQLiteCurrentSchemaDoesNotTakeMigrationLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "once.db")
+	store, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	locker, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Close()
+	locker.SetMaxOpenConns(1)
+	ctx := context.Background()
+	conn, err := locker.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.ExecContext(ctx, "ROLLBACK")
+
+	tookMigrationLock := false
+	store, err = openSQLite(path, sqliteInitOptions{
+		migrationBusyTimeoutMS: 1,
+		afterMigrationLock: func() {
+			tookMigrationLock = true
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if tookMigrationLock {
+		t.Fatal("current schema took migration lock")
+	}
+}
+
+func TestOpenSQLiteConfiguresOperationalConnection(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "once.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	assertSQLiteConnectionPragmas(t, store.db, true)
 }
 
 func TestOpenSQLiteInitializesSchemaVersion(t *testing.T) {
@@ -380,87 +517,105 @@ func TestOpenSQLiteInitializesSchemaVersion(t *testing.T) {
 	}
 }
 
-func TestOpenSQLiteRejectsNewerSchemaVersion(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "once.db")
-	db, err := sql.Open("sqlite", path)
+func TestOpenSQLiteReappliesConnectionPragmasAfterReplacement(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "once.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`
-CREATE TABLE once_meta (
-	key TEXT PRIMARY KEY,
-	value TEXT NOT NULL
-);
-INSERT INTO once_meta (key, value) VALUES ('schema_version', '999');
-`); err != nil {
-		_ = db.Close()
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := RestrictLocalFile(path); err != nil {
-		t.Fatal(err)
-	}
+	defer store.Close()
 
-	store, err := OpenSQLite(path)
-	if err == nil {
-		_ = store.Close()
-		t.Fatal("OpenSQLite succeeded, want newer schema error")
-	}
-	if !strings.Contains(err.Error(), "newer sqlite schema") {
-		t.Fatalf("err = %v", err)
-	}
-
-	db, err = sql.Open("sqlite", path)
+	ctx := context.Background()
+	conn, err := store.db.Conn(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
-	var recordTableCount int
-	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'once_records'`).Scan(&recordTableCount); err != nil {
-		t.Fatal(err)
-	}
-	if recordTableCount != 0 {
-		t.Fatalf("once_records table count = %d, want 0", recordTableCount)
-	}
-	for _, sidecar := range []string{path + "-wal", path + "-shm"} {
-		if _, err := os.Stat(sidecar); !os.IsNotExist(err) {
-			t.Fatalf("sidecar %s exists or stat failed: %v", sidecar, err)
+	for _, pragma := range []string{
+		"PRAGMA busy_timeout = 1",
+		"PRAGMA synchronous = NORMAL",
+		"PRAGMA foreign_keys = OFF",
+	} {
+		if _, err := conn.ExecContext(ctx, pragma); err != nil {
+			_ = conn.Close()
+			t.Fatal(err)
 		}
 	}
+	if err := conn.Raw(func(any) error { return driver.ErrBadConn }); !errors.Is(err, driver.ErrBadConn) {
+		_ = conn.Close()
+		t.Fatalf("discard connection err = %v, want %v", err, driver.ErrBadConn)
+	}
+	_ = conn.Close()
+
+	assertSQLiteConnectionPragmas(t, store.db, false)
 }
 
-func TestOpenSQLiteRejectsOlderSchemaVersionWithoutMigration(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "once.db")
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
+func TestOpenSQLiteRejectsIncompatibleSchemaWithoutMutation(t *testing.T) {
+	tests := []struct {
+		name    string
+		version string
+		wantErr string
+	}{
+		{name: "newer", version: "999", wantErr: "newer sqlite schema"},
+		{name: "older", version: "0", wantErr: "older sqlite schema"},
+		{name: "invalid", version: "invalid", wantErr: "invalid sqlite schema version"},
 	}
-	if _, err := db.Exec(`
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "once.db")
+			db, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`
 CREATE TABLE once_meta (
 	key TEXT PRIMARY KEY,
 	value TEXT NOT NULL
 );
-INSERT INTO once_meta (key, value) VALUES ('schema_version', '0');
-`); err != nil {
-		_ = db.Close()
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := RestrictLocalFile(path); err != nil {
-		t.Fatal(err)
-	}
+INSERT INTO once_meta (key, value) VALUES ('schema_version', ?);
+`, tt.version); err != nil {
+				_ = db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := RestrictLocalFile(path); err != nil {
+				t.Fatal(err)
+			}
 
-	store, err := OpenSQLite(path)
-	if err == nil {
-		_ = store.Close()
-		t.Fatal("OpenSQLite succeeded, want older schema error")
-	}
-	if !strings.Contains(err.Error(), "older sqlite schema") {
-		t.Fatalf("err = %v", err)
+			store, err := OpenSQLite(path)
+			if err == nil {
+				_ = store.Close()
+				t.Fatalf("OpenSQLite succeeded, want %s schema error", tt.name)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("err = %v, want %q", err, tt.wantErr)
+			}
+
+			db, err = sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			var recordTableCount int
+			if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'once_records'`).Scan(&recordTableCount); err != nil {
+				t.Fatal(err)
+			}
+			if recordTableCount != 0 {
+				t.Fatalf("once_records table count = %d, want 0", recordTableCount)
+			}
+			var journalMode string
+			if err := db.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
+				t.Fatal(err)
+			}
+			if journalMode != "delete" {
+				t.Fatalf("journal_mode = %q, want delete", journalMode)
+			}
+			for _, sidecar := range []string{path + "-wal", path + "-shm"} {
+				if _, err := os.Stat(sidecar); !os.IsNotExist(err) {
+					t.Fatalf("sidecar %s exists or stat failed: %v", sidecar, err)
+				}
+			}
+		})
 	}
 }
 
@@ -906,10 +1061,135 @@ func TestOpenSQLiteRejectsSymlinkSidecarsBeforeOpen(t *testing.T) {
 	}
 }
 
+func TestRestrictSQLiteFilesRejectsMissingMainDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.db")
+	if err := restrictSQLiteFiles(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("restrictSQLiteFiles err = %v, want %v", err, os.ErrNotExist)
+	}
+}
+
 func recordKeys(records []Record) []string {
 	keys := make([]string, len(records))
 	for i, rec := range records {
 		keys[i] = rec.Key
 	}
 	return keys
+}
+
+type sqlitePragmaQueryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+type sqliteOpenResult struct {
+	store *SQLiteStore
+	err   error
+}
+
+func createLegacySQLiteStore(t *testing.T, path string) {
+	t.Helper()
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := db.Exec(`
+CREATE TABLE once_records (
+	key TEXT PRIMARY KEY,
+	state TEXT NOT NULL CHECK (state IN ('running', 'succeeded', 'failed')),
+	exit_code INTEGER NOT NULL DEFAULT 0,
+	stdout BLOB NOT NULL DEFAULT X'',
+	stderr BLOB NOT NULL DEFAULT X'',
+	error TEXT NOT NULL DEFAULT '',
+	command TEXT NOT NULL DEFAULT '[]',
+	started_at TEXT NOT NULL,
+	finished_at TEXT,
+	updated_at TEXT NOT NULL
+);
+CREATE INDEX once_records_state_idx ON once_records(state);
+INSERT INTO once_records (key, state, command, started_at, updated_at)
+VALUES ('legacy', 'running', '["old"]', ?, ?);
+`, formatTime(now), formatTime(now)); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := RestrictLocalFile(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitSQLiteTestSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+func waitSQLiteOpenResult(t *testing.T, result <-chan sqliteOpenResult) sqliteOpenResult {
+	t.Helper()
+	select {
+	case got := <-result:
+		return got
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for SQLite opener")
+		return sqliteOpenResult{}
+	}
+}
+
+func assertSQLiteMigrationStamped(t *testing.T, db sqlitePragmaQueryer) {
+	t.Helper()
+
+	ctx := context.Background()
+	var columnCount int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('once_records') WHERE name = 'attempt_hash'`).Scan(&columnCount); err != nil {
+		t.Fatal(err)
+	}
+	if columnCount != 1 {
+		t.Fatalf("attempt_hash column count = %d, want 1", columnCount)
+	}
+	var version string
+	if err := db.QueryRowContext(ctx, `SELECT value FROM once_meta WHERE key = 'schema_version'`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != sqliteSchemaVersion {
+		t.Fatalf("schema version = %q, want %q", version, sqliteSchemaVersion)
+	}
+}
+
+func assertSQLiteConnectionPragmas(t *testing.T, db sqlitePragmaQueryer, checkJournal bool) {
+	t.Helper()
+
+	ctx := context.Background()
+	if checkJournal {
+		var journalMode string
+		if err := db.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&journalMode); err != nil {
+			t.Fatal(err)
+		}
+		if journalMode != "wal" {
+			t.Errorf("journal_mode = %q, want wal", journalMode)
+		}
+	}
+
+	for _, check := range []struct {
+		name  string
+		query string
+		want  int
+	}{
+		{name: "busy_timeout", query: "PRAGMA busy_timeout", want: 5000},
+		{name: "synchronous", query: "PRAGMA synchronous", want: 2},
+		{name: "foreign_keys", query: "PRAGMA foreign_keys", want: 1},
+	} {
+		var got int
+		if err := db.QueryRowContext(ctx, check.query).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != check.want {
+			t.Errorf("%s = %d, want %d", check.name, got, check.want)
+		}
+	}
 }
