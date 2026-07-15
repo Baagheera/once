@@ -2,6 +2,7 @@
 import hashlib
 import os
 import platform
+import re
 import stat
 import subprocess
 import sys
@@ -13,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
+EXPECTED_GO_VERSION = "go1.26.5"
 TARGETS = (
     ("linux", "amd64", ".tar.gz", "once"),
     ("linux", "arm64", ".tar.gz", "once"),
@@ -43,11 +45,15 @@ def verify_dist(version: str) -> None:
 
     expected = {archive_name(version, goos, goarch, suffix) for goos, goarch, suffix, _ in TARGETS}
     expected.add("SHA256SUMS")
-    actual = {path.name for path in DIST.iterdir() if path.is_file()}
+    entries = list(DIST.iterdir())
+    actual = {path.name for path in entries}
     if actual != expected:
         missing = sorted(expected - actual)
         extra = sorted(actual - expected)
         raise RuntimeError(f"unexpected dist files; missing={missing} extra={extra}")
+    for path in entries:
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"non-regular dist entry: {path.name}")
 
     checksums = read_checksums(DIST / "SHA256SUMS")
     if set(checksums) != expected - {"SHA256SUMS"}:
@@ -82,29 +88,38 @@ def read_checksums(path: Path) -> dict[str, str]:
         digest, filename = line.split(maxsplit=1)
         if len(digest) != 64:
             raise RuntimeError(f"invalid digest for {filename}")
+        if filename in checksums:
+            raise RuntimeError(f"duplicate checksum entry for {filename}")
         checksums[filename] = digest
     return checksums
 
 
 def verify_tar(path: Path, binary: str) -> None:
     with tarfile.open(path, "r:gz") as tf:
-        members = {member.name: member for member in tf.getmembers()}
-        if set(members) != {binary, "README.md", "LICENSE"}:
-            raise RuntimeError(f"unexpected tar contents in {path.name}: {sorted(members)}")
-        for member in members.values():
+        members = tf.getmembers()
+        names = unique_member_names([member.name for member in members], path.name)
+        if names != {binary, "README.md", "LICENSE"}:
+            raise RuntimeError(f"unexpected tar contents in {path.name}: {sorted(names)}")
+        for member in members:
             reject_unsafe_archive_name(path, member.name)
             if not member.isfile():
                 raise RuntimeError(f"non-regular tar entry in {path.name}: {member.name}")
-        if members[binary].mode & 0o111 == 0:
+        binary_member = next(member for member in members if member.name == binary)
+        if binary_member.mode & 0o111 == 0:
             raise RuntimeError(f"{binary} is not executable in {path.name}")
+        binary_file = tf.extractfile(binary_member)
+        if binary_file is None:
+            raise RuntimeError(f"cannot read {binary} from {path.name}")
+        verify_archive_binary(binary_file.read(), binary, path.name)
 
 
 def verify_zip(path: Path, binary: str) -> None:
     with zipfile.ZipFile(path) as zf:
-        names = set(zf.namelist())
+        infos = zf.infolist()
+        names = unique_member_names([info.filename for info in infos], path.name)
         if names != {binary, "README.md", "LICENSE"}:
             raise RuntimeError(f"unexpected zip contents in {path.name}: {sorted(names)}")
-        for info in zf.infolist():
+        for info in infos:
             reject_unsafe_archive_name(path, info.filename)
             if info.is_dir():
                 raise RuntimeError(f"directory zip entry in {path.name}: {info.filename}")
@@ -112,6 +127,49 @@ def verify_zip(path: Path, binary: str) -> None:
             file_type = stat.S_IFMT(mode)
             if file_type not in (0, stat.S_IFREG):
                 raise RuntimeError(f"non-regular zip entry in {path.name}: {info.filename}")
+        verify_archive_binary(zf.read(binary), binary, path.name)
+
+
+def unique_member_names(names: list[str], archive: str) -> set[str]:
+    unique: set[str] = set()
+    for name in names:
+        if name in unique:
+            raise RuntimeError(f"duplicate archive member in {archive}: {name}")
+        unique.add(name)
+    return unique
+
+
+def verify_archive_binary(contents: bytes, binary: str, archive: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="once-release-verify-") as tmp:
+        binary_path = Path(tmp) / binary
+        binary_path.write_bytes(contents)
+        result = subprocess.run(
+            ["go", "version", "-m", str(binary_path)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    if result.returncode != 0:
+        detail = (
+            result.stderr.strip()
+            or result.stdout.strip()
+            or f"exit code {result.returncode}"
+        )
+        raise RuntimeError(f"cannot read Go build metadata from {archive}: {detail}")
+    verify_go_metadata(result.stdout, archive)
+
+
+def verify_go_metadata(metadata: str, archive: str) -> None:
+    lines = metadata.splitlines()
+    first_line = lines[0] if lines else ""
+    _, separator, version = first_line.rpartition(": ")
+    version_pattern = r"go\d+\.\d+(?:\.\d+)?(?:beta\d+|rc\d+)?"
+    if not separator or not re.fullmatch(version_pattern, version):
+        raise RuntimeError(f"malformed Go build metadata in {archive}: {first_line!r}")
+    if version != EXPECTED_GO_VERSION:
+        raise RuntimeError(
+            f"{archive} embedded Go version = {version!r}, want {EXPECTED_GO_VERSION!r}"
+        )
 
 
 def reject_unsafe_archive_name(path: Path, name: str) -> None:

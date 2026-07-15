@@ -4,6 +4,18 @@ User-facing changes are recorded here as releases are prepared.
 
 ## Unreleased
 
+## v0.6.1 - 2026-07-15
+
+### Security
+
+- Release artifacts are built with Go 1.26.5, including the standard-library
+  security fixes in that release.
+
+### Changed
+
+- CI tests the supported Go lines with Go 1.26.5 and Go 1.25.12.
+- Manual release builds must be dispatched from the requested tag.
+
 ## v0.6.0 - 2026-07-06
 
 ### Added

@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Tag to package, such as v0.5.0
+        description: Tag to package; dispatch this workflow from the same tag
         required: true
 
 permissions:
@@ -32,10 +32,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version: 1.26.x
-          cache: true
+      - run: python scripts/verify_workflow_toolchains.py
       - name: Choose tag
         id: tag
         shell: bash
@@ -60,6 +57,12 @@ jobs:
             echo "release tag does not exist: $tag" >&2
             exit 1
           fi
+          if [ "$GITHUB_REF_TYPE" != "tag" ] ||
+             [ "$GITHUB_REF_NAME" != "$tag" ] ||
+             [ "$tag_commit" != "$GITHUB_SHA" ]; then
+            echo "dispatch this workflow from the requested tag" >&2
+            exit 1
+          fi
           if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
             echo "release tag must point to a commit reachable from origin/main" >&2
             exit 1
@@ -67,6 +70,12 @@ jobs:
           printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
       - name: Check out tag
         run: git checkout --detach "${{ steps.tag.outputs.tag }}"
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.26.5
+          cache: true
+      - name: Scan Go vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.5.0 ./...
       - name: Build artifacts
         run: python scripts/build_release_artifacts.py "${{ steps.tag.outputs.tag }}"
       - name: Verify artifacts
