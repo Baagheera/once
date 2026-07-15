@@ -324,6 +324,99 @@ func TestOpenSQLiteMigratesMissingAttemptHash(t *testing.T) {
 	}
 }
 
+func TestOpenSQLiteEnablesWALBeforeMigrationLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "once.db")
+	createLegacySQLiteStore(t, path)
+
+	var observedMode string
+	var observeErr error
+	store, err := openSQLite(path, sqliteInitOptions{
+		afterMigrationLock: func() {
+			observer, err := sql.Open("sqlite", path)
+			if err != nil {
+				observeErr = err
+				return
+			}
+			defer observer.Close()
+			observeErr = observer.QueryRow("PRAGMA journal_mode").Scan(&observedMode)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if observeErr != nil {
+		t.Fatal(observeErr)
+	}
+	if observedMode != "wal" {
+		t.Fatalf("journal_mode during migration lock = %q, want wal", observedMode)
+	}
+}
+
+func TestOpenSQLiteConcurrentEmptyFirstOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "once.db")
+	missingMetadata := make(chan struct{}, 2)
+	release := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	results := make(chan sqliteOpenResult, 2)
+
+	for i := 0; i < 2; i++ {
+		go func() {
+			store, err := openSQLite(path, sqliteInitOptions{
+				afterMissingMetadataRead: func() {
+					missingMetadata <- struct{}{}
+					<-release
+				},
+			})
+			results <- sqliteOpenResult{store: store, err: err}
+		}()
+	}
+	waitSQLiteTestSignal(t, missingMetadata, "first opener to observe missing metadata")
+	waitSQLiteTestSignal(t, missingMetadata, "second opener to observe missing metadata")
+	close(release)
+	released = true
+
+	stores := make([]*SQLiteStore, 0, 2)
+	for i := 0; i < 2; i++ {
+		result := waitSQLiteOpenResult(t, results)
+		if result.err != nil {
+			t.Errorf("opener %d: %v", i+1, result.err)
+		}
+		if result.store != nil {
+			defer result.store.Close()
+			stores = append(stores, result.store)
+		}
+	}
+	if len(stores) != 2 {
+		t.FailNow()
+	}
+
+	assertSQLiteMigrationStamped(t, stores[0].db)
+	var versionRows int
+	if err := stores[0].db.QueryRow(`SELECT count(*) FROM once_meta WHERE key = 'schema_version'`).Scan(&versionRows); err != nil {
+		t.Fatal(err)
+	}
+	if versionRows != 1 {
+		t.Fatalf("schema_version row count = %d, want 1", versionRows)
+	}
+	for i, key := range []string{"first-empty-opener", "second-empty-opener"} {
+		assertSQLiteConnectionPragmas(t, stores[i].db, true)
+		if _, fresh, err := stores[i].Reserve(key, []string{"true"}); err != nil {
+			t.Fatalf("opener %d Reserve: %v", i+1, err)
+		} else if !fresh {
+			t.Fatalf("opener %d Reserve was not fresh", i+1)
+		}
+		if _, err := stores[i].Get(key); err != nil {
+			t.Fatalf("opener %d Get: %v", i+1, err)
+		}
+	}
+}
+
 func TestOpenSQLiteSerializesConcurrentLegacyMigration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "once.db")
 	createLegacySQLiteStore(t, path)
@@ -355,7 +448,7 @@ func TestOpenSQLiteSerializesConcurrentLegacyMigration(t *testing.T) {
 
 	go func() {
 		store, err := openSQLite(path, sqliteInitOptions{
-			afterMissingVersionRead: func() {
+			afterMissingMetadataRead: func() {
 				close(secondSawMissing)
 			},
 			afterMigrationLock: func() {
@@ -479,6 +572,93 @@ func TestOpenSQLiteLockedLegacyMigrationIsAtomic(t *testing.T) {
 	}
 	defer store.Close()
 	assertSQLiteMigrationStamped(t, store.db)
+}
+
+func TestOpenSQLiteRejectsMetadataWithoutSchemaVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "once.db")
+	createLegacySQLiteStore(t, path)
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+CREATE TABLE once_meta (
+	key TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+);
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := OpenSQLite(path)
+	if err == nil {
+		_ = store.Close()
+		t.Fatal("OpenSQLite succeeded with metadata missing schema_version")
+	}
+	var missingVersion interface {
+		error
+		sqliteSchemaVersionMissing()
+	}
+	if !errors.As(err, &missingVersion) {
+		t.Fatalf("OpenSQLite err = %T %v, want missing-version sentinel", err, err)
+	}
+	if !errors.Is(err, errSQLiteSchemaVersionMissing) {
+		t.Fatalf("OpenSQLite err = %v, want errSQLiteSchemaVersionMissing", err)
+	}
+
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var journalMode string
+	if err := db.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if journalMode != "delete" {
+		_ = db.Close()
+		t.Fatalf("journal_mode = %q, want delete", journalMode)
+	}
+	var columnCount int
+	if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('once_records') WHERE name = 'attempt_hash'`).Scan(&columnCount); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if columnCount != 0 {
+		_ = db.Close()
+		t.Fatalf("attempt_hash column count = %d, want 0", columnCount)
+	}
+	var versionRows int
+	if err := db.QueryRow(`SELECT count(*) FROM once_meta WHERE key = 'schema_version'`).Scan(&versionRows); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if versionRows != 0 {
+		_ = db.Close()
+		t.Fatalf("schema_version row count = %d, want 0", versionRows)
+	}
+	var state string
+	var command string
+	if err := db.QueryRow(`SELECT state, command FROM once_records WHERE key = 'legacy'`).Scan(&state, &command); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if state != "running" || command != `["old"]` {
+		_ = db.Close()
+		t.Fatalf("legacy state=%q command=%q, want running and [\"old\"]", state, command)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, sidecar := range []string{path + "-wal", path + "-shm", path + "-journal"} {
+		if _, err := os.Stat(sidecar); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("sidecar %s exists or stat failed: %v", sidecar, err)
+		}
+	}
 }
 
 func TestOpenSQLiteCurrentSchemaDoesNotTakeMigrationLock(t *testing.T) {

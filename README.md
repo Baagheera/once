@@ -267,10 +267,15 @@ a request can be retried or a key can be reused, and inspect a prune dry run
 before deleting anything.
 
 A live WAL database is not just its `.db` file. Copying that file by itself can
-miss committed data. For a simple file backup, stop every once process that can
-open the store before copying it. Otherwise, use a SQLite-consistent online
-backup. Restore only while once is stopped, use a once version that supports
-the stored schema, and preserve restrictive permissions and the HTTP token
+miss committed data. For a simple file backup, every SQLite user must close the
+store cleanly and remain stopped while it is copied. If a `-wal` file remains,
+it is part of the database state and must stay paired with that exact `.db`;
+otherwise, use SQLite's online backup mechanism.
+
+Restore only while every SQLite user remains stopped. Replace or remove the old
+`.db`, `-wal`, `-shm`, and `-journal` files as one controlled set so journals
+from different points in time are never mixed. Use a once version that supports
+the stored schema, preserve restrictive permissions, and keep the HTTP token
 file when one is in use.
 
 After restoring an older snapshot, reconcile external effects newer than that

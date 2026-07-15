@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	sqlite "modernc.org/sqlite"
@@ -20,6 +21,26 @@ type SQLiteStore struct {
 	db *sql.DB
 }
 
+var sqliteDurabilityPreflightMu sync.Mutex
+
+type sqliteMetadataState uint8
+
+const (
+	sqliteMetadataAbsent sqliteMetadataState = iota
+	sqliteMetadataVersionMissing
+	sqliteMetadataVersionPresent
+)
+
+type sqliteSchemaVersionMissingError struct{}
+
+func (sqliteSchemaVersionMissingError) Error() string {
+	return "sqlite metadata table is missing schema_version"
+}
+
+func (sqliteSchemaVersionMissingError) sqliteSchemaVersionMissing() {}
+
+var errSQLiteSchemaVersionMissing = sqliteSchemaVersionMissingError{}
+
 const (
 	sqliteSchemaVersion   = "1"
 	sqliteDriverName      = "github.com/Baagheera/once/sqlite"
@@ -28,9 +49,9 @@ const (
 )
 
 type sqliteInitOptions struct {
-	afterMissingVersionRead func()
-	afterMigrationLock      func()
-	migrationBusyTimeoutMS  int
+	afterMissingMetadataRead func()
+	afterMigrationLock       func()
+	migrationBusyTimeoutMS   int
 }
 
 func init() {
@@ -132,24 +153,30 @@ func (s *SQLiteStore) init(options sqliteInitOptions) error {
 	}
 	defer conn.Close()
 
-	version, missing, err := readSQLiteSchemaVersion(ctx, conn)
+	metadataState, version, err := readSQLiteSchemaVersion(ctx, conn)
 	if err != nil {
 		return err
 	}
-	if !missing {
+	switch metadataState {
+	case sqliteMetadataVersionMissing:
+		return errSQLiteSchemaVersionMissing
+	case sqliteMetadataVersionPresent:
 		if err := CheckSQLiteSchemaVersion(version); err != nil {
 			return err
 		}
 		return configureSQLiteConnection(ctx, conn)
 	}
 
+	if options.afterMissingMetadataRead != nil {
+		options.afterMissingMetadataRead()
+	}
 	if options.migrationBusyTimeoutMS > 0 {
 		if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", options.migrationBusyTimeoutMS)); err != nil {
 			return err
 		}
 	}
-	if options.afterMissingVersionRead != nil {
-		options.afterMissingVersionRead()
+	if err := configureSQLiteDurabilityBeforeMigration(ctx, conn); err != nil {
+		return err
 	}
 	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		return err
@@ -164,21 +191,27 @@ func (s *SQLiteStore) init(options sqliteInitOptions) error {
 		options.afterMigrationLock()
 	}
 
-	version, missing, err = readSQLiteSchemaVersion(ctx, conn)
+	metadataState, version, err = readSQLiteSchemaVersion(ctx, conn)
 	if err != nil {
 		return err
 	}
-	if missing {
+	switch metadataState {
+	case sqliteMetadataAbsent:
 		if err := initializeSQLiteSchema(ctx, conn); err != nil {
 			return err
 		}
-		version, missing, err = readSQLiteSchemaVersion(ctx, conn)
+		metadataState, version, err = readSQLiteSchemaVersion(ctx, conn)
 		if err != nil {
 			return err
 		}
-		if missing {
+		if metadataState == sqliteMetadataVersionMissing {
+			return errSQLiteSchemaVersionMissing
+		}
+		if metadataState != sqliteMetadataVersionPresent {
 			return fmt.Errorf("sqlite schema version is missing after initialization")
 		}
+	case sqliteMetadataVersionMissing:
+		return errSQLiteSchemaVersionMissing
 	}
 	if err := CheckSQLiteSchemaVersion(version); err != nil {
 		return err
@@ -691,26 +724,26 @@ func sqliteFilePaths(path string) []string {
 	return []string{path, path + "-wal", path + "-shm"}
 }
 
-func readSQLiteSchemaVersion(ctx context.Context, conn *sql.Conn) (string, bool, error) {
+func readSQLiteSchemaVersion(ctx context.Context, conn *sql.Conn) (sqliteMetadataState, string, error) {
 	var exists int
 	if err := conn.QueryRowContext(ctx, `SELECT EXISTS (
 	SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'once_meta'
 )`).Scan(&exists); err != nil {
-		return "", false, err
+		return 0, "", err
 	}
 	if exists == 0 {
-		return "", true, nil
+		return sqliteMetadataAbsent, "", nil
 	}
 
 	var version string
 	err := conn.QueryRowContext(ctx, `SELECT value FROM once_meta WHERE key = 'schema_version'`).Scan(&version)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", true, nil
+		return sqliteMetadataVersionMissing, "", nil
 	}
 	if err != nil {
-		return "", false, err
+		return 0, "", err
 	}
-	return version, false, nil
+	return sqliteMetadataVersionPresent, version, nil
 }
 
 func initializeSQLiteSchema(ctx context.Context, conn *sql.Conn) error {
@@ -784,7 +817,7 @@ func ensureSQLiteColumn(ctx context.Context, conn *sql.Conn, table, column, ddl 
 	return err
 }
 
-func configureSQLiteConnection(ctx context.Context, conn *sql.Conn) error {
+func configureSQLiteDurability(ctx context.Context, conn *sql.Conn) error {
 	var journalMode string
 	if err := conn.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&journalMode); err != nil {
 		return err
@@ -800,6 +833,26 @@ func configureSQLiteConnection(ctx context.Context, conn *sql.Conn) error {
 	if _, err := conn.ExecContext(ctx, "PRAGMA synchronous = FULL"); err != nil {
 		return err
 	}
+	var synchronous int
+	if err := conn.QueryRowContext(ctx, "PRAGMA synchronous").Scan(&synchronous); err != nil {
+		return err
+	}
+	if synchronous != sqliteSynchronousFull {
+		return fmt.Errorf("sqlite synchronous = %d, want %d", synchronous, sqliteSynchronousFull)
+	}
+	return nil
+}
+
+func configureSQLiteDurabilityBeforeMigration(ctx context.Context, conn *sql.Conn) error {
+	sqliteDurabilityPreflightMu.Lock()
+	defer sqliteDurabilityPreflightMu.Unlock()
+	return configureSQLiteDurability(ctx, conn)
+}
+
+func configureSQLiteConnection(ctx context.Context, conn *sql.Conn) error {
+	if err := configureSQLiteDurability(ctx, conn); err != nil {
+		return err
+	}
 
 	for _, check := range []struct {
 		name  string
@@ -807,7 +860,6 @@ func configureSQLiteConnection(ctx context.Context, conn *sql.Conn) error {
 		want  int
 	}{
 		{name: "busy timeout", query: "PRAGMA busy_timeout", want: sqliteBusyTimeoutMS},
-		{name: "synchronous", query: "PRAGMA synchronous", want: sqliteSynchronousFull},
 		{name: "foreign keys", query: "PRAGMA foreign_keys", want: 1},
 	} {
 		var got int
