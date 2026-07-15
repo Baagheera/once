@@ -687,25 +687,67 @@ func scanRecord(scanner recordScanner) (Record, error) {
 func restrictSQLiteFiles(path string) error {
 	for i, name := range sqliteFilePaths(path) {
 		allowMissing := i > 0
-		if err := RejectSymlinkPath(name); err != nil {
+		if err := restrictSQLiteFile(name, allowMissing); err != nil {
+			return fmt.Errorf("restrict sqlite file %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func restrictSQLiteFile(name string, allowMissing bool) error {
+	const (
+		initialDelay = 5 * time.Millisecond
+		maximumDelay = 100 * time.Millisecond
+	)
+	err := restrictSQLiteFileOnce(name, allowMissing)
+	if err == nil || !allowMissing || !errors.Is(err, os.ErrPermission) {
+		return err
+	}
+
+	// SQLite can temporarily deny metadata access to a live sidecar on Windows.
+	deadline := time.Now().Add(time.Duration(sqliteBusyTimeoutMS) * time.Millisecond)
+	delay := initialDelay
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			return err
 		}
-		info, err := os.Stat(name)
-		if err != nil {
-			if allowMissing && errors.Is(err, os.ErrNotExist) {
-				continue
+		if delay > remaining {
+			delay = remaining
+		}
+		time.Sleep(delay)
+		err = restrictSQLiteFileOnce(name, allowMissing)
+		if err == nil || !errors.Is(err, os.ErrPermission) {
+			return err
+		}
+		if delay < maximumDelay {
+			delay *= 2
+			if delay > maximumDelay {
+				delay = maximumDelay
 			}
-			return err
 		}
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("sqlite path must be a regular file: %s", name)
+	}
+}
+
+func restrictSQLiteFileOnce(name string, allowMissing bool) error {
+	if err := RejectSymlinkPath(name); err != nil {
+		return err
+	}
+	info, err := os.Stat(name)
+	if err != nil {
+		if allowMissing && errors.Is(err, os.ErrNotExist) {
+			return nil
 		}
-		if err := RestrictLocalFile(name); err != nil {
-			if allowMissing && errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			return err
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("sqlite path must be a regular file: %s", name)
+	}
+	if err := RestrictLocalFile(name); err != nil {
+		if allowMissing && errors.Is(err, os.ErrNotExist) {
+			return nil
 		}
+		return err
 	}
 	return nil
 }
