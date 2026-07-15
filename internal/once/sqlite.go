@@ -47,9 +47,10 @@ const (
 )
 
 type sqliteInitOptions struct {
-	afterMissingMetadataRead func()
-	afterMigrationLock       func()
-	migrationBusyTimeoutMS   int
+	afterMissingMetadataRead     func()
+	afterMigrationLock           func()
+	afterWALTransitionContention func()
+	migrationBusyTimeoutMS       int
 }
 
 func init() {
@@ -162,7 +163,7 @@ func (s *SQLiteStore) init(options sqliteInitOptions) error {
 		if err := CheckSQLiteSchemaVersion(version); err != nil {
 			return err
 		}
-		return configureSQLiteConnection(ctx, conn)
+		return configureSQLiteConnection(ctx, conn, options.afterWALTransitionContention)
 	}
 
 	if options.afterMissingMetadataRead != nil {
@@ -173,7 +174,7 @@ func (s *SQLiteStore) init(options sqliteInitOptions) error {
 			return err
 		}
 	}
-	if err := configureSQLiteDurability(ctx, conn); err != nil {
+	if err := configureSQLiteDurability(ctx, conn, options.afterWALTransitionContention); err != nil {
 		return err
 	}
 	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
@@ -224,7 +225,7 @@ func (s *SQLiteStore) init(options sqliteInitOptions) error {
 			return err
 		}
 	}
-	return configureSQLiteConnection(ctx, conn)
+	return configureSQLiteConnection(ctx, conn, options.afterWALTransitionContention)
 }
 
 func (s *SQLiteStore) Reserve(key string, command []string) (Record, bool, error) {
@@ -815,13 +816,13 @@ func ensureSQLiteColumn(ctx context.Context, conn *sql.Conn, table, column, ddl 
 	return err
 }
 
-func configureSQLiteDurability(ctx context.Context, conn *sql.Conn) error {
+func configureSQLiteDurability(ctx context.Context, conn *sql.Conn, afterWALTransitionContention func()) error {
 	var journalMode string
 	if err := conn.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&journalMode); err != nil {
 		return err
 	}
 	if !strings.EqualFold(journalMode, "wal") {
-		if err := transitionSQLiteJournalModeToWAL(ctx, conn); err != nil {
+		if err := transitionSQLiteJournalModeToWAL(ctx, conn, afterWALTransitionContention); err != nil {
 			return err
 		}
 	}
@@ -838,7 +839,7 @@ func configureSQLiteDurability(ctx context.Context, conn *sql.Conn) error {
 	return nil
 }
 
-func transitionSQLiteJournalModeToWAL(ctx context.Context, conn *sql.Conn) error {
+func transitionSQLiteJournalModeToWAL(ctx context.Context, conn *sql.Conn, afterContention func()) error {
 	retryCtx, cancel := context.WithTimeout(ctx, time.Duration(sqliteBusyTimeoutMS)*time.Millisecond)
 	defer cancel()
 
@@ -848,6 +849,7 @@ func transitionSQLiteJournalModeToWAL(ctx context.Context, conn *sql.Conn) error
 	)
 	delay := initialDelay
 	var lastErr error
+	contentionReported := false
 	for {
 		var journalMode string
 		err := conn.QueryRowContext(retryCtx, "PRAGMA journal_mode = WAL").Scan(&journalMode)
@@ -860,6 +862,10 @@ func transitionSQLiteJournalModeToWAL(ctx context.Context, conn *sql.Conn) error
 			return err
 		default:
 			lastErr = err
+		}
+		if !contentionReported && afterContention != nil {
+			contentionReported = true
+			afterContention()
 		}
 
 		timer := time.NewTimer(delay)
@@ -892,8 +898,8 @@ func isSQLiteLockContention(err error) bool {
 	return baseCode == sqlite3.SQLITE_BUSY || baseCode == sqlite3.SQLITE_LOCKED
 }
 
-func configureSQLiteConnection(ctx context.Context, conn *sql.Conn) error {
-	if err := configureSQLiteDurability(ctx, conn); err != nil {
+func configureSQLiteConnection(ctx context.Context, conn *sql.Conn, afterWALTransitionContention func()) error {
+	if err := configureSQLiteDurability(ctx, conn, afterWALTransitionContention); err != nil {
 		return err
 	}
 

@@ -456,14 +456,20 @@ func TestOpenSQLiteConcurrentEmptyFirstOpenAcrossProcesses(t *testing.T) {
 	releasePath := filepath.Join(barrierDir, "release")
 	children := make([]childProcess, openerCount)
 	markers := make([]string, openerCount)
+	contentionMarkers := make([]string, openerCount)
+	contentionReleasePaths := make([]string, openerCount)
 	for i := range children {
 		markers[i] = filepath.Join(barrierDir, "ready-"+strconv.Itoa(i))
+		contentionMarkers[i] = filepath.Join(barrierDir, "contention-"+strconv.Itoa(i))
+		contentionReleasePaths[i] = filepath.Join(barrierDir, "contention-release-"+strconv.Itoa(i))
 		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestOpenSQLiteConcurrentEmptyFirstOpenProcessHelper$", "-test.count=1")
 		cmd.Env = append(os.Environ(),
 			"ONCE_SQLITE_OPEN_HELPER=1",
 			"ONCE_SQLITE_OPEN_PATH="+path,
 			"ONCE_SQLITE_OPEN_MARKER="+markers[i],
 			"ONCE_SQLITE_OPEN_RELEASE="+releasePath,
+			"ONCE_SQLITE_OPEN_CONTENTION_MARKER="+contentionMarkers[i],
+			"ONCE_SQLITE_OPEN_CONTENTION_RELEASE="+contentionReleasePaths[i],
 		)
 		children[i].cmd = cmd
 		cmd.Stdout = &children[i].stdout
@@ -473,37 +479,77 @@ func TestOpenSQLiteConcurrentEmptyFirstOpenAcrossProcesses(t *testing.T) {
 		}
 	}
 
-	deadline := time.Now().Add(10 * time.Second)
-	for i, marker := range markers {
-		for {
-			if _, err := os.Stat(marker); err == nil {
-				break
-			} else if !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("stat opener %d marker: %v", i+1, err)
+	childrenFinished := false
+	stopChildren := func() {
+		if childrenFinished {
+			return
+		}
+		cancel()
+		for i := range children {
+			_ = children[i].cmd.Wait()
+		}
+		childrenFinished = true
+	}
+	defer stopChildren()
+	childOutput := func() string {
+		var output strings.Builder
+		for i := range children {
+			output.WriteString("opener ")
+			output.WriteString(strconv.Itoa(i + 1))
+			output.WriteString(" stdout:\n")
+			output.WriteString(children[i].stdout.String())
+			output.WriteString("\nstderr:\n")
+			output.WriteString(children[i].stderr.String())
+			output.WriteByte('\n')
+		}
+		return output.String()
+	}
+	failBarrier := func(message string) {
+		stopChildren()
+		t.Fatalf("%s\n%s", message, childOutput())
+	}
+	waitForMarkers := func(paths []string, description string) {
+		deadline := time.Now().Add(10 * time.Second)
+		for i, marker := range paths {
+			for {
+				if _, err := os.Stat(marker); err == nil {
+					break
+				} else if !errors.Is(err, os.ErrNotExist) {
+					failBarrier("stat opener " + strconv.Itoa(i+1) + " " + description + " marker: " + err.Error())
+				}
+				if time.Now().After(deadline) {
+					failBarrier("timed out waiting for opener " + strconv.Itoa(i+1) + " to " + description)
+				}
+				select {
+				case <-ctx.Done():
+					failBarrier("context ended waiting for opener " + strconv.Itoa(i+1) + " to " + description + ": " + ctx.Err().Error())
+				case <-time.After(5 * time.Millisecond):
+				}
 			}
-			if time.Now().After(deadline) {
-				t.Fatalf("timed out waiting for opener %d to read missing metadata", i+1)
-			}
-			time.Sleep(5 * time.Millisecond)
 		}
 	}
-	if err := os.WriteFile(releasePath, []byte("release"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 
-	// Keep the RESERVED lock long enough for every opener to attempt the WAL
-	// transition. SQLite does not reliably apply busy_timeout to this PRAGMA.
-	time.Sleep(150 * time.Millisecond)
+	waitForMarkers(markers, "read missing metadata")
+	if err := os.WriteFile(releasePath, []byte("release"), 0o600); err != nil {
+		failBarrier("release subprocesses after metadata barrier: " + err.Error())
+	}
+	waitForMarkers(contentionMarkers, "observe WAL transition contention")
 	if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
-		t.Fatal(err)
+		failBarrier("release SQLite lock: " + err.Error())
 	}
 	locked = false
 
+	// Complete one opener at a time so the 1 ms timeout isolates the WAL
+	// transition instead of creating unrelated migration-lock failures.
 	for i := range children {
+		if err := os.WriteFile(contentionReleasePaths[i], []byte("release"), 0o600); err != nil {
+			failBarrier("release opener " + strconv.Itoa(i+1) + " after contention barrier: " + err.Error())
+		}
 		if err := children[i].cmd.Wait(); err != nil {
 			t.Errorf("opener %d: %v\nstdout:\n%s\nstderr:\n%s", i+1, err, children[i].stdout.String(), children[i].stderr.String())
 		}
 	}
+	childrenFinished = true
 	if t.Failed() {
 		return
 	}
@@ -523,24 +569,36 @@ func TestOpenSQLiteConcurrentEmptyFirstOpenProcessHelper(t *testing.T) {
 
 	marker := os.Getenv("ONCE_SQLITE_OPEN_MARKER")
 	release := os.Getenv("ONCE_SQLITE_OPEN_RELEASE")
+	contentionMarker := os.Getenv("ONCE_SQLITE_OPEN_CONTENTION_MARKER")
+	contentionRelease := os.Getenv("ONCE_SQLITE_OPEN_CONTENTION_RELEASE")
+	waitForRelease := func(path, description string) {
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			if _, err := os.Stat(path); err == nil {
+				return
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Fatal(err)
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for " + description)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
 	store, err := openSQLite(os.Getenv("ONCE_SQLITE_OPEN_PATH"), sqliteInitOptions{
 		afterMissingMetadataRead: func() {
 			if err := os.WriteFile(marker, []byte("ready"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			deadline := time.Now().Add(10 * time.Second)
-			for {
-				if _, err := os.Stat(release); err == nil {
-					return
-				} else if !errors.Is(err, os.ErrNotExist) {
-					t.Fatal(err)
-				}
-				if time.Now().After(deadline) {
-					t.Fatal("timed out waiting for subprocess release")
-				}
-				time.Sleep(5 * time.Millisecond)
-			}
+			waitForRelease(release, "subprocess metadata release")
 		},
+		afterWALTransitionContention: func() {
+			if err := os.WriteFile(contentionMarker, []byte("contention"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			waitForRelease(contentionRelease, "subprocess contention release")
+		},
+		migrationBusyTimeoutMS: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -934,9 +992,14 @@ func TestConfigureSQLiteDurabilityStopsAtContextDeadline(t *testing.T) {
 
 	retryCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
-	err = configureSQLiteDurability(retryCtx, contenderConn)
+	started := time.Now()
+	err = configureSQLiteDurability(retryCtx, contenderConn, nil)
+	elapsed := time.Since(started)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("configureSQLiteDurability err = %T %v, want context deadline exceeded", err, err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("configureSQLiteDurability elapsed = %v, want at most 1s", elapsed)
 	}
 }
 
