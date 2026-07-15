@@ -13,6 +13,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	sqlite "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 func TestReserveCommitAndReplay(t *testing.T) {
@@ -376,6 +379,31 @@ func TestOpenSQLiteSerializesConcurrentLegacyMigration(t *testing.T) {
 		stores = append(stores, result.store)
 	}
 	assertSQLiteMigrationStamped(t, stores[0].db)
+
+	legacy, err := stores[0].Get("legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.State != Running || len(legacy.Command) != 1 || legacy.Command[0] != "old" {
+		t.Fatalf("legacy record = %#v", legacy)
+	}
+	for i, key := range []string{"first-opener", "second-opener"} {
+		if _, fresh, err := stores[i].Reserve(key, []string{"true"}); err != nil {
+			t.Fatalf("opener %d Reserve: %v", i+1, err)
+		} else if !fresh {
+			t.Fatalf("opener %d Reserve was not fresh", i+1)
+		}
+		if _, err := stores[i].Get(key); err != nil {
+			t.Fatalf("opener %d Get: %v", i+1, err)
+		}
+	}
+	var versionRows int
+	if err := stores[0].db.QueryRow(`SELECT count(*) FROM once_meta WHERE key = 'schema_version'`).Scan(&versionRows); err != nil {
+		t.Fatal(err)
+	}
+	if versionRows != 1 {
+		t.Fatalf("schema_version row count = %d, want 1", versionRows)
+	}
 }
 
 func TestOpenSQLiteLockedLegacyMigrationIsAtomic(t *testing.T) {
@@ -416,8 +444,13 @@ func TestOpenSQLiteLockedLegacyMigrationIsAtomic(t *testing.T) {
 		_ = store.Close()
 		t.Fatal("openSQLite succeeded while legacy migration was locked")
 	}
-	if !strings.Contains(strings.ToLower(err.Error()), "locked") {
-		t.Fatalf("openSQLite err = %v, want locked database error", err)
+	var sqliteErr *sqlite.Error
+	if !errors.As(err, &sqliteErr) {
+		t.Fatalf("openSQLite err = %T %v, want *sqlite.Error", err, err)
+	}
+	baseCode := sqliteErr.Code() & 0xff
+	if baseCode != sqlite3.SQLITE_BUSY && baseCode != sqlite3.SQLITE_LOCKED {
+		t.Fatalf("sqlite base code = %d, want SQLITE_BUSY or SQLITE_LOCKED", baseCode)
 	}
 
 	var metaCount int
