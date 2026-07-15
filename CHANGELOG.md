@@ -4,6 +4,8 @@ User-facing changes are recorded here as releases are prepared.
 
 ## Unreleased
 
+## v1.0.0 - 2026-07-15
+
 ### Security
 
 - The Go HTTP client no longer follows redirects, keeping bearer tokens,
@@ -13,6 +15,10 @@ User-facing changes are recorded here as releases are prepared.
 
 ### Changed
 
+- The documented CLI commands, flags, and exit semantics, HTTP `/v1` API, and
+  exported `oncehttp` API now have a semantic-versioning compatibility
+  contract. The SQLite schema remains an internal implementation detail, while
+  stores remain compatible across the v1 release line.
 - Unexpected store failures now return a generic HTTP 500 response instead of
   being reported as invalid commit or delete requests.
 - `once serve` binds before announcing its listener and drains active requests
@@ -27,8 +33,26 @@ User-facing changes are recorded here as releases are prepared.
 
 ### Fixed
 
+- Stores with malformed SQLite schema objects are rejected before use.
 - The PowerShell quick start now uses a missing per-user application-data
   directory instead of the shared temporary directory.
+
+## v0.7.0 - 2026-07-15
+
+### Security
+
+- SQLite database, WAL, shared-memory, and rollback-journal files use
+  restrictive permissions.
+- Store paths reject unsafe ancestry on Unix-like systems and Windows.
+
+### Changed
+
+- Concurrent SQLite startup now serializes schema initialization and journal
+  mode transitions.
+- Stores require verified WAL mode with `synchronous=FULL`.
+- Retention, backup, and restore boundaries are documented.
+- `golang.org/x/sys` was updated to v0.47.0, and Windows SID pointers remain
+  pinned while ACL entries are built.
 
 ## v0.6.1 - 2026-07-15
 

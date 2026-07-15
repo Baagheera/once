@@ -474,13 +474,26 @@ long-running state machine, use a workflow engine. once is deliberately smaller.
 
 ## Stability
 
-once is experimental before `v1.0.0`.
+once follows semantic versioning from `v1.0.0`.
 
-The CLI and HTTP API are the main public surfaces. `oncehttp` is a small
-experimental wrapper around the HTTP API. Other Go packages are internal today.
-The SQLite schema may still change before `v1.0.0`; once records a schema
-version and rejects stores that declare an unsupported version, but the storage
-file is not yet a separately stable integration contract.
+The documented CLI commands, flags, and exit-code semantics, the HTTP `/v1`
+API, and the exported `oncehttp` API are supported public surfaces. Breaking
+changes to those surfaces require a new major version. Other Go packages remain
+internal.
+
+Human-readable diagnostics and tabular command output are for operators, not
+stable machine formats. Use `export` JSON Lines, `doctor --json`, or the HTTP
+JSON API for integrations.
+
+The SQLite file is durable user data, but its schema is not a public integration
+API. Releases in the v1 line preserve stores written by earlier v1 releases
+through compatible schema changes or explicit migrations. A release that
+cannot safely open a store rejects it rather than silently using it. Direct
+queries and edits are unsupported.
+
+This compatibility contract does not change the failure model: once cannot
+make a side effect atomic with its terminal commit, and it does not claim
+exactly-once execution.
 
 ## Development
 
