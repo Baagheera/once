@@ -1,13 +1,16 @@
 package once
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -417,6 +420,136 @@ func TestOpenSQLiteConcurrentEmptyFirstOpen(t *testing.T) {
 	}
 }
 
+func TestOpenSQLiteConcurrentEmptyFirstOpenAcrossProcesses(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "once.db")
+	locker, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Close()
+	locker.SetMaxOpenConns(1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	conn, err := locker.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	locked := true
+	defer func() {
+		if locked {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+
+	type childProcess struct {
+		cmd    *exec.Cmd
+		stdout bytes.Buffer
+		stderr bytes.Buffer
+	}
+	const openerCount = 8
+	barrierDir := t.TempDir()
+	releasePath := filepath.Join(barrierDir, "release")
+	children := make([]childProcess, openerCount)
+	markers := make([]string, openerCount)
+	for i := range children {
+		markers[i] = filepath.Join(barrierDir, "ready-"+strconv.Itoa(i))
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestOpenSQLiteConcurrentEmptyFirstOpenProcessHelper$", "-test.count=1")
+		cmd.Env = append(os.Environ(),
+			"ONCE_SQLITE_OPEN_HELPER=1",
+			"ONCE_SQLITE_OPEN_PATH="+path,
+			"ONCE_SQLITE_OPEN_MARKER="+markers[i],
+			"ONCE_SQLITE_OPEN_RELEASE="+releasePath,
+		)
+		children[i].cmd = cmd
+		cmd.Stdout = &children[i].stdout
+		cmd.Stderr = &children[i].stderr
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start opener %d: %v", i+1, err)
+		}
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for i, marker := range markers {
+		for {
+			if _, err := os.Stat(marker); err == nil {
+				break
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("stat opener %d marker: %v", i+1, err)
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for opener %d to read missing metadata", i+1)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if err := os.WriteFile(releasePath, []byte("release"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Keep the RESERVED lock long enough for every opener to attempt the WAL
+	// transition. SQLite does not reliably apply busy_timeout to this PRAGMA.
+	time.Sleep(150 * time.Millisecond)
+	if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+		t.Fatal(err)
+	}
+	locked = false
+
+	for i := range children {
+		if err := children[i].cmd.Wait(); err != nil {
+			t.Errorf("opener %d: %v\nstdout:\n%s\nstderr:\n%s", i+1, err, children[i].stdout.String(), children[i].stderr.String())
+		}
+	}
+	if t.Failed() {
+		return
+	}
+
+	store, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	assertSQLiteMigrationStamped(t, store.db)
+}
+
+func TestOpenSQLiteConcurrentEmptyFirstOpenProcessHelper(t *testing.T) {
+	if os.Getenv("ONCE_SQLITE_OPEN_HELPER") != "1" {
+		return
+	}
+
+	marker := os.Getenv("ONCE_SQLITE_OPEN_MARKER")
+	release := os.Getenv("ONCE_SQLITE_OPEN_RELEASE")
+	store, err := openSQLite(os.Getenv("ONCE_SQLITE_OPEN_PATH"), sqliteInitOptions{
+		afterMissingMetadataRead: func() {
+			if err := os.WriteFile(marker, []byte("ready"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				if _, err := os.Stat(release); err == nil {
+					return
+				} else if !errors.Is(err, os.ErrNotExist) {
+					t.Fatal(err)
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("timed out waiting for subprocess release")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestOpenSQLiteSerializesConcurrentLegacyMigration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "once.db")
 	createLegacySQLiteStore(t, path)
@@ -701,6 +834,109 @@ func TestOpenSQLiteCurrentSchemaDoesNotTakeMigrationLock(t *testing.T) {
 	defer store.Close()
 	if tookMigrationLock {
 		t.Fatal("current schema took migration lock")
+	}
+}
+
+func TestOpenSQLiteConcurrentCurrentSchemaDeleteMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "once.db")
+	store, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	const (
+		rounds      = 8
+		openerCount = 16
+	)
+	for round := 0; round < rounds; round++ {
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var journalMode string
+		if err := db.QueryRow("PRAGMA journal_mode = DELETE").Scan(&journalMode); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if journalMode != "delete" {
+			t.Fatalf("round %d journal_mode = %q, want delete", round+1, journalMode)
+		}
+
+		start := make(chan struct{})
+		results := make(chan sqliteOpenResult, openerCount)
+		for i := 0; i < openerCount; i++ {
+			go func() {
+				<-start
+				store, err := OpenSQLite(path)
+				results <- sqliteOpenResult{store: store, err: err}
+			}()
+		}
+		close(start)
+
+		stores := make([]*SQLiteStore, 0, openerCount)
+		for i := 0; i < openerCount; i++ {
+			result := waitSQLiteOpenResult(t, results)
+			if result.err != nil {
+				t.Errorf("round %d opener %d: %v", round+1, i+1, result.err)
+			}
+			if result.store != nil {
+				stores = append(stores, result.store)
+			}
+		}
+		for _, store := range stores {
+			if err := store.Close(); err != nil {
+				t.Error(err)
+			}
+		}
+		if t.Failed() {
+			return
+		}
+	}
+}
+
+func TestConfigureSQLiteDurabilityStopsAtContextDeadline(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "once.db")
+	locker, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Close()
+	locker.SetMaxOpenConns(1)
+
+	ctx := context.Background()
+	lockerConn, err := locker.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockerConn.Close()
+	if _, err := lockerConn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	defer lockerConn.ExecContext(ctx, "ROLLBACK")
+
+	contender, err := sql.Open(sqliteDriverName, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer contender.Close()
+	contender.SetMaxOpenConns(1)
+	contenderConn, err := contender.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer contenderConn.Close()
+
+	retryCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	err = configureSQLiteDurability(retryCtx, contenderConn)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("configureSQLiteDurability err = %T %v, want context deadline exceeded", err, err)
 	}
 }
 
@@ -1250,7 +1486,7 @@ func TestOpenSQLiteRejectsSymlinkSidecarsBeforeOpen(t *testing.T) {
 		t.Skip("symlink creation requires privileges on some Windows installs")
 	}
 
-	for _, suffix := range []string{"-wal", "-shm"} {
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
 		t.Run(suffix, func(t *testing.T) {
 			dir := t.TempDir()
 			db := filepath.Join(dir, "once.db")
@@ -1278,6 +1514,20 @@ func TestRestrictSQLiteFilesRejectsMissingMainDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing.db")
 	if err := restrictSQLiteFiles(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("restrictSQLiteFiles err = %v, want %v", err, os.ErrNotExist)
+	}
+}
+
+func TestSQLiteFilePathsIncludesRollbackJournal(t *testing.T) {
+	path := filepath.Join("store", "once.db")
+	want := []string{path, path + "-wal", path + "-shm", path + "-journal"}
+	got := sqliteFilePaths(path)
+	if len(got) != len(want) {
+		t.Fatalf("sqliteFilePaths() = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("sqliteFilePaths()[%d] = %q, want %q", i, got[i], want[i])
+		}
 	}
 }
 

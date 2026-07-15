@@ -11,17 +11,15 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	sqlite "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 type SQLiteStore struct {
 	db *sql.DB
 }
-
-var sqliteDurabilityPreflightMu sync.Mutex
 
 type sqliteMetadataState uint8
 
@@ -175,7 +173,7 @@ func (s *SQLiteStore) init(options sqliteInitOptions) error {
 			return err
 		}
 	}
-	if err := configureSQLiteDurabilityBeforeMigration(ctx, conn); err != nil {
+	if err := configureSQLiteDurability(ctx, conn); err != nil {
 		return err
 	}
 	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
@@ -721,7 +719,7 @@ func rejectSQLiteFileSymlinks(path string) error {
 }
 
 func sqliteFilePaths(path string) []string {
-	return []string{path, path + "-wal", path + "-shm"}
+	return []string{path, path + "-wal", path + "-shm", path + "-journal"}
 }
 
 func readSQLiteSchemaVersion(ctx context.Context, conn *sql.Conn) (sqliteMetadataState, string, error) {
@@ -823,11 +821,8 @@ func configureSQLiteDurability(ctx context.Context, conn *sql.Conn) error {
 		return err
 	}
 	if !strings.EqualFold(journalMode, "wal") {
-		if err := conn.QueryRowContext(ctx, "PRAGMA journal_mode = WAL").Scan(&journalMode); err != nil {
+		if err := transitionSQLiteJournalModeToWAL(ctx, conn); err != nil {
 			return err
-		}
-		if !strings.EqualFold(journalMode, "wal") {
-			return fmt.Errorf("sqlite journal mode = %q, want wal", journalMode)
 		}
 	}
 	if _, err := conn.ExecContext(ctx, "PRAGMA synchronous = FULL"); err != nil {
@@ -843,10 +838,58 @@ func configureSQLiteDurability(ctx context.Context, conn *sql.Conn) error {
 	return nil
 }
 
-func configureSQLiteDurabilityBeforeMigration(ctx context.Context, conn *sql.Conn) error {
-	sqliteDurabilityPreflightMu.Lock()
-	defer sqliteDurabilityPreflightMu.Unlock()
-	return configureSQLiteDurability(ctx, conn)
+func transitionSQLiteJournalModeToWAL(ctx context.Context, conn *sql.Conn) error {
+	retryCtx, cancel := context.WithTimeout(ctx, time.Duration(sqliteBusyTimeoutMS)*time.Millisecond)
+	defer cancel()
+
+	const (
+		initialDelay = 5 * time.Millisecond
+		maximumDelay = 100 * time.Millisecond
+	)
+	delay := initialDelay
+	var lastErr error
+	for {
+		var journalMode string
+		err := conn.QueryRowContext(retryCtx, "PRAGMA journal_mode = WAL").Scan(&journalMode)
+		switch {
+		case err == nil && strings.EqualFold(journalMode, "wal"):
+			return nil
+		case err == nil:
+			lastErr = fmt.Errorf("sqlite journal mode = %q, want wal", journalMode)
+		case !isSQLiteLockContention(err):
+			return err
+		default:
+			lastErr = err
+		}
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-retryCtx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return fmt.Errorf("sqlite journal mode did not become wal (%v): %w", lastErr, retryCtx.Err())
+		case <-timer.C:
+		}
+		if delay < maximumDelay {
+			delay *= 2
+			if delay > maximumDelay {
+				delay = maximumDelay
+			}
+		}
+	}
+}
+
+func isSQLiteLockContention(err error) bool {
+	var sqliteErr *sqlite.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	baseCode := sqliteErr.Code() & 0xff
+	return baseCode == sqlite3.SQLITE_BUSY || baseCode == sqlite3.SQLITE_LOCKED
 }
 
 func configureSQLiteConnection(ctx context.Context, conn *sql.Conn) error {
