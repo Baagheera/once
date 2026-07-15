@@ -3,141 +3,144 @@ import unittest
 import verify_workflow_toolchains as workflow
 
 
-SETUP_GO = "actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6"
-
-
-def setup_step(version: str) -> str:
-    return f"""      - uses: {SETUP_GO}
-        with:
-          go-version: {version}
-          cache: true
-"""
-
-
-CI_CURRENT_SETUP = setup_step("1.26.5")
-CI_MINIMUM_SETUP = setup_step("1.25.12")
-CHECKOUT_STEP = """      - name: Check out tag
-        run: git checkout --detach "${{ steps.tag.outputs.tag }}"
-"""
-RELEASE_SETUP = setup_step("1.26.5")
-SCAN_STEP = """      - name: Scan Go vulnerabilities
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.5.0 ./...
-"""
-BUILD_STEP = """      - name: Build artifacts
-        run: python scripts/build_release_artifacts.py "${{ steps.tag.outputs.tag }}"
-"""
-VERIFY_STEP = """      - name: Verify artifacts
-        run: python scripts/verify_release_artifacts.py "${{ steps.tag.outputs.tag }}"
-"""
-RELEASE_SEQUENCE = CHECKOUT_STEP + RELEASE_SETUP + SCAN_STEP + BUILD_STEP + VERIFY_STEP
-PROVENANCE_GATE = """          if [ "$tag_commit" != "$GITHUB_SHA" ]; then
-            echo "dispatch this workflow from the requested tag" >&2
-            exit 1
-          fi
-"""
-
-VALID_CI = f"""name: ci
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-{CI_CURRENT_SETUP}
-  minimum-go:
-    runs-on: ubuntu-latest
-    steps:
-{CI_MINIMUM_SETUP}"""
-
-VALID_RELEASE = f"""name: release
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Choose tag
-        id: tag
-        run: |
-          if ! tag_commit="$(git rev-parse -q --verify "refs/tags/$tag^{{commit}}")"; then
-            exit 1
-          fi
-{PROVENANCE_GATE}{RELEASE_SEQUENCE}"""
-
-
-def with_step_control(step: str, control: str) -> str:
-    return step.replace("        run:", f"        {control}\n        run:", 1)
-
-
-def with_job_control(text: str, job: str, control: str) -> str:
-    return text.replace(f"  {job}:\n", f"  {job}:\n{control}", 1)
+VALID_CI = workflow.CI_WORKFLOW.read_text(encoding="utf-8")
+VALID_RELEASE = workflow.RELEASE_WORKFLOW.read_text(encoding="utf-8")
 
 
 class WorkflowToolchainTests(unittest.TestCase):
     def assert_invalid(self, ci: str, release: str) -> None:
         failures = workflow.workflow_failures(ci, release)
         self.assertTrue(failures, "unsafe fixture was accepted")
+        for failure in failures:
+            self.assertIn("workflow policy changed", failure)
+            self.assertIn("approved SHA-256", failure)
+            self.assertIn("review", failure)
 
-    def test_accepts_canonical_workflows(self) -> None:
+    def replace_once(self, text: str, old: str, new: str) -> str:
+        self.assertEqual(text.count(old), 1, f"fixture marker is not unique: {old!r}")
+        return text.replace(old, new, 1)
+
+    def test_accepts_live_canonical_workflows(self) -> None:
         self.assertEqual(workflow.workflow_failures(VALID_CI, VALID_RELEASE), [])
 
-    def test_rejects_extra_scan_step_controls(self) -> None:
-        for control in (
-            "shell: bash",
-            "env:\n          FLAG: unsafe",
-            "working-directory: scripts",
-        ):
-            with self.subTest(control=control):
-                scan = with_step_control(SCAN_STEP, control)
-                self.assert_invalid(VALID_CI, VALID_RELEASE.replace(SCAN_STEP, scan))
+    def test_accepts_equivalent_line_endings(self) -> None:
+        for ending in ("\r\n", "\r"):
+            with self.subTest(ending=repr(ending)):
+                ci = VALID_CI.replace("\n", ending)
+                release = VALID_RELEASE.replace("\n", ending)
+                self.assertEqual(workflow.workflow_failures(ci, release), [])
 
-    def test_rejects_conditional_or_non_blocking_build(self) -> None:
-        for control in ("if: always()", "continue-on-error: true"):
-            with self.subTest(control=control):
-                build = with_step_control(BUILD_STEP, control)
-                self.assert_invalid(VALID_CI, VALID_RELEASE.replace(BUILD_STEP, build))
-
-    def test_rejects_workflow_or_critical_job_env_and_defaults(self) -> None:
-        for control in (
-            "env:\n  FLAG: unsafe\n\n",
-            "defaults:\n  run:\n    shell: bash\n\n",
-        ):
-            self.assert_invalid(control + VALID_CI, VALID_RELEASE)
-            self.assert_invalid(VALID_CI, control + VALID_RELEASE)
-
-        for control in (
-            "    env:\n      FLAG: unsafe\n",
-            "    defaults:\n      run:\n        shell: bash\n",
-        ):
-            for job in ("test", "minimum-go"):
-                ci = with_job_control(VALID_CI, job, control)
-                self.assert_invalid(ci, VALID_RELEASE)
-            release = with_job_control(VALID_RELEASE, "build", control)
-            self.assert_invalid(VALID_CI, release)
-
-    def test_rejects_missing_mismatched_or_duplicate_provenance_gate(self) -> None:
-        releases = (
-            VALID_RELEASE.replace(PROVENANCE_GATE, ""),
-            VALID_RELEASE.replace("$GITHUB_SHA", "$GITHUB_REF"),
-            VALID_RELEASE.replace(PROVENANCE_GATE, PROVENANCE_GATE * 2),
+    def test_rejects_changed_go_pins(self) -> None:
+        mutations = (
+            self.replace_once(VALID_CI, "go-version: 1.26.5", "go-version: 1.26.4"),
+            self.replace_once(VALID_CI, "go-version: 1.25.12", "go-version: 1.25.11"),
         )
-        for release in releases:
+        for ci in mutations:
+            with self.subTest(ci=ci):
+                self.assert_invalid(ci, VALID_RELEASE)
+
+    def test_rejects_each_tag_provenance_change(self) -> None:
+        without_ref_type = self.replace_once(
+            VALID_RELEASE,
+            """          if [ "$GITHUB_REF_TYPE" != "tag" ] ||
+             [ "$GITHUB_REF_NAME" != "$tag" ] ||
+""",
+            '          if [ "$GITHUB_REF_NAME" != "$tag" ] ||\n',
+        )
+        without_ref_name = self.replace_once(
+            VALID_RELEASE,
+            '             [ "$GITHUB_REF_NAME" != "$tag" ] ||\n',
+            "",
+        )
+        changed_sha = self.replace_once(
+            VALID_RELEASE,
+            '             [ "$tag_commit" != "$GITHUB_SHA" ]; then',
+            '             [ "$tag_commit" != "$GITHUB_REF" ]; then',
+        )
+        for name, release in (
+            ("ref-type", without_ref_type),
+            ("ref-name", without_ref_name),
+            ("sha", changed_sha),
+        ):
+            with self.subTest(condition=name):
+                self.assert_invalid(VALID_CI, release)
+
+    def test_rejects_arbitrary_step_before_tag_selection(self) -> None:
+        marker = "      - name: Choose tag\n"
+        extra = """      - name: Run arbitrary command
+        run: printf unsafe
+"""
+        release = self.replace_once(VALID_RELEASE, marker, extra + marker)
+        self.assert_invalid(VALID_CI, release)
+
+    def test_rejects_mutation_and_reupload_after_canonical_upload(self) -> None:
+        marker = "          if-no-files-found: error\n"
+        extra = """      - name: Mutate uploaded artifacts
+        run: printf unsafe >> dist/once-linux-amd64.tar.gz
+      - name: Re-upload mutated artifacts
+        uses: actions/upload-artifact@main
+        with:
+          name: release-dist-mutated
+          path: dist/*
+"""
+        release = self.replace_once(VALID_RELEASE, marker, marker + extra)
+        self.assert_invalid(VALID_CI, release)
+
+    def test_rejects_changed_build_permissions_or_checkout(self) -> None:
+        changed_permissions = self.replace_once(
+            VALID_RELEASE,
+            """    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+""",
+            """    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+""",
+        )
+        changed_checkout = self.replace_once(
+            VALID_RELEASE,
+            "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+            "actions/checkout@main",
+        )
+        for release in (changed_permissions, changed_checkout):
             with self.subTest(release=release):
                 self.assert_invalid(VALID_CI, release)
 
-    def test_rejects_reordered_release_sequence(self) -> None:
-        reordered = CHECKOUT_STEP + RELEASE_SETUP + BUILD_STEP + SCAN_STEP + VERIFY_STEP
-        self.assert_invalid(VALID_CI, VALID_RELEASE.replace(RELEASE_SEQUENCE, reordered))
-
-    def test_rejects_swapped_ci_versions(self) -> None:
-        swapped = VALID_CI.replace("go-version: 1.26.5", "go-version: SWAP", 1)
-        swapped = swapped.replace("go-version: 1.25.12", "go-version: 1.26.5", 1)
-        swapped = swapped.replace("go-version: SWAP", "go-version: 1.25.12", 1)
-        self.assert_invalid(swapped, VALID_RELEASE)
-
-    def test_rejects_additional_setup_go_steps(self) -> None:
-        extra_ci = VALID_CI.replace(CI_CURRENT_SETUP, CI_CURRENT_SETUP * 2, 1)
-        extra_release = VALID_RELEASE.replace(RELEASE_SEQUENCE, RELEASE_SETUP + RELEASE_SEQUENCE)
-        self.assert_invalid(extra_ci, VALID_RELEASE)
-        self.assert_invalid(VALID_CI, extra_release)
+    def test_rejects_changed_publish_policy_or_extra_job(self) -> None:
+        changed_action = self.replace_once(
+            VALID_RELEASE,
+            "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+            "actions/download-artifact@main",
+        )
+        changed_permissions = self.replace_once(
+            VALID_RELEASE,
+            """  publish:
+    name: publish-release
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+""",
+            """  publish:
+    name: publish-release
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+""",
+        )
+        extra_job = VALID_RELEASE + """
+  unexpected:
+    runs-on: ubuntu-latest
+    steps:
+      - run: printf unsafe
+"""
+        for release in (changed_action, changed_permissions, extra_job):
+            with self.subTest(release=release):
+                self.assert_invalid(VALID_CI, release)
 
 
 if __name__ == "__main__":

@@ -57,7 +57,9 @@ jobs:
             echo "release tag does not exist: $tag" >&2
             exit 1
           fi
-          if [ "$tag_commit" != "$GITHUB_SHA" ]; then
+          if [ "$GITHUB_REF_TYPE" != "tag" ] ||
+             [ "$GITHUB_REF_NAME" != "$tag" ] ||
+             [ "$tag_commit" != "$GITHUB_SHA" ]; then
             echo "dispatch this workflow from the requested tag" >&2
             exit 1
           fi
