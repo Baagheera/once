@@ -269,8 +269,9 @@ before deleting anything.
 A live WAL database is not just its `.db` file. Copying that file by itself can
 miss committed data. For a simple file backup, every SQLite user must close the
 store cleanly and remain stopped while it is copied. If a `-wal` file remains,
-it is part of the database state and must stay paired with that exact `.db`;
-otherwise, use SQLite's online backup mechanism.
+it is part of the database state and must stay paired with that exact `.db`.
+If users cannot remain stopped, or the database and WAL cannot be preserved as
+a matched set, use SQLite's online backup mechanism.
 
 Restore only while every SQLite user remains stopped. Replace or remove the old
 `.db`, `-wal`, `-shm`, and `-journal` files as one controlled set so journals
