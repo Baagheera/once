@@ -855,6 +855,209 @@ CREATE TABLE once_meta (
 	}
 }
 
+func TestOpenSQLiteRejectsMalformedRecordSchemaWithoutMutation(t *testing.T) {
+	tests := []struct {
+		name           string
+		options        malformedSQLiteSchemaOptions
+		wantErr        string
+		wantMetaTables int
+	}{
+		{
+			name: "unversioned current schema without primary key",
+			options: malformedSQLiteSchemaOptions{
+				attemptHash:     true,
+				exitCodeDefault: true,
+				stateIndex:      true,
+			},
+			wantErr: "key column is not the primary key",
+		},
+		{
+			name: "unversioned legacy schema without primary key",
+			options: malformedSQLiteSchemaOptions{
+				exitCodeDefault: true,
+				stateIndex:      true,
+			},
+			wantErr: "key column is not the primary key",
+		},
+		{
+			name: "current version without primary key",
+			options: malformedSQLiteSchemaOptions{
+				attemptHash:     true,
+				exitCodeDefault: true,
+				stateIndex:      true,
+				metadata:        true,
+			},
+			wantErr:        "key column is not the primary key",
+			wantMetaTables: 1,
+		},
+		{
+			name: "current version with legacy record schema",
+			options: malformedSQLiteSchemaOptions{
+				primaryKey:      true,
+				exitCodeDefault: true,
+				stateIndex:      true,
+				metadata:        true,
+			},
+			wantErr:        "once_records missing columns: attempt_hash",
+			wantMetaTables: 1,
+		},
+		{
+			name: "unversioned current schema without required default",
+			options: malformedSQLiteSchemaOptions{
+				primaryKey:  true,
+				attemptHash: true,
+				stateIndex:  true,
+			},
+			wantErr: "exit_code column default is <none>, want 0",
+		},
+		{
+			name: "current version without required default",
+			options: malformedSQLiteSchemaOptions{
+				primaryKey:  true,
+				attemptHash: true,
+				stateIndex:  true,
+				metadata:    true,
+			},
+			wantErr:        "exit_code column default is <none>, want 0",
+			wantMetaTables: 1,
+		},
+		{
+			name: "current version without state index",
+			options: malformedSQLiteSchemaOptions{
+				primaryKey:      true,
+				attemptHash:     true,
+				exitCodeDefault: true,
+				metadata:        true,
+			},
+			wantErr:        "once_records_state_idx index is missing",
+			wantMetaTables: 1,
+		},
+		{
+			name: "current version with composite primary key",
+			options: malformedSQLiteSchemaOptions{
+				compositePrimaryKey: true,
+				attemptHash:         true,
+				exitCodeDefault:     true,
+				stateIndex:          true,
+				metadata:            true,
+			},
+			wantErr:        "key column is not the sole primary key",
+			wantMetaTables: 1,
+		},
+		{
+			name: "current version with unsupported column",
+			options: malformedSQLiteSchemaOptions{
+				primaryKey:      true,
+				attemptHash:     true,
+				exitCodeDefault: true,
+				stateIndex:      true,
+				metadata:        true,
+				extraColumn:     true,
+			},
+			wantErr:        "unsupported columns: extra",
+			wantMetaTables: 1,
+		},
+		{
+			name: "current version with wrong state index",
+			options: malformedSQLiteSchemaOptions{
+				primaryKey:      true,
+				attemptHash:     true,
+				exitCodeDefault: true,
+				stateIndex:      true,
+				wrongStateIndex: true,
+				metadata:        true,
+			},
+			wantErr:        "once_records_state_idx index must index only state",
+			wantMetaTables: 1,
+		},
+		{
+			name: "unversioned schema with wrong state index",
+			options: malformedSQLiteSchemaOptions{
+				primaryKey:      true,
+				attemptHash:     true,
+				exitCodeDefault: true,
+				stateIndex:      true,
+				wrongStateIndex: true,
+			},
+			wantErr: "once_records_state_idx index must index only state",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "once.db")
+			createMalformedSQLiteStore(t, path, tt.options)
+
+			store, err := OpenSQLite(path)
+			if err == nil {
+				_ = store.Close()
+				t.Fatal("OpenSQLite succeeded with malformed once_records schema")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("OpenSQLite err = %v, want %q", err, tt.wantErr)
+			}
+
+			db, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+
+			var journalMode string
+			if err := db.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
+				t.Fatal(err)
+			}
+			if journalMode != "delete" {
+				t.Fatalf("journal_mode = %q, want delete", journalMode)
+			}
+
+			var metaTables int
+			if err := db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'once_meta'").Scan(&metaTables); err != nil {
+				t.Fatal(err)
+			}
+			if metaTables != tt.wantMetaTables {
+				t.Fatalf("once_meta table count = %d, want %d", metaTables, tt.wantMetaTables)
+			}
+
+			var attemptColumns int
+			if err := db.QueryRow("SELECT count(*) FROM pragma_table_info('once_records') WHERE name = 'attempt_hash'").Scan(&attemptColumns); err != nil {
+				t.Fatal(err)
+			}
+			wantAttemptColumns := 0
+			if tt.options.attemptHash {
+				wantAttemptColumns = 1
+			}
+			if attemptColumns != wantAttemptColumns {
+				t.Fatalf("attempt_hash column count = %d, want %d", attemptColumns, wantAttemptColumns)
+			}
+		})
+	}
+}
+
+func TestOpenSQLiteRepairsSupportedUnversionedSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "once.db")
+	createMalformedSQLiteStore(t, path, malformedSQLiteSchemaOptions{
+		primaryKey:      true,
+		attemptHash:     true,
+		exitCodeDefault: true,
+	})
+
+	store, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	assertSQLiteMigrationStamped(t, store.db)
+	var indexCount int
+	if err := store.db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'once_records_state_idx'").Scan(&indexCount); err != nil {
+		t.Fatal(err)
+	}
+	if indexCount != 1 {
+		t.Fatalf("state index count = %d, want 1", indexCount)
+	}
+}
+
 func TestOpenSQLiteCurrentSchemaDoesNotTakeMigrationLock(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "once.db")
 	store, err := OpenSQLite(path)
@@ -1612,6 +1815,92 @@ type sqlitePragmaQueryer interface {
 type sqliteOpenResult struct {
 	store *SQLiteStore
 	err   error
+}
+
+type malformedSQLiteSchemaOptions struct {
+	primaryKey          bool
+	compositePrimaryKey bool
+	attemptHash         bool
+	exitCodeDefault     bool
+	stateIndex          bool
+	wrongStateIndex     bool
+	metadata            bool
+	extraColumn         bool
+}
+
+func createMalformedSQLiteStore(t *testing.T, path string, options malformedSQLiteSchemaOptions) {
+	t.Helper()
+
+	keyDefinition := "key TEXT"
+	if options.primaryKey {
+		keyDefinition = "key TEXT PRIMARY KEY"
+	}
+	primaryKeyConstraint := ""
+	if options.compositePrimaryKey {
+		primaryKeyConstraint = ", PRIMARY KEY (key, state)"
+	}
+	attemptDefinition := ""
+	if options.attemptHash {
+		attemptDefinition = "attempt_hash TEXT NOT NULL DEFAULT '',"
+	}
+	exitCodeDefinition := "exit_code INTEGER NOT NULL"
+	if options.exitCodeDefault {
+		exitCodeDefinition += " DEFAULT 0"
+	}
+	extraDefinition := ""
+	if options.extraColumn {
+		extraDefinition = "extra TEXT,"
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE once_records (` +
+		keyDefinition + `,
+` + attemptDefinition + `
+	state TEXT NOT NULL CHECK (state IN ('running', 'succeeded', 'failed')),
+	` + exitCodeDefinition + `,
+	stdout BLOB NOT NULL DEFAULT X'',
+	stderr BLOB NOT NULL DEFAULT X'',
+	error TEXT NOT NULL DEFAULT '',
+	command TEXT NOT NULL DEFAULT '[]',
+	` + extraDefinition + `
+	started_at TEXT NOT NULL,
+	finished_at TEXT,
+	updated_at TEXT NOT NULL` + primaryKeyConstraint + `
+);`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if options.stateIndex {
+		indexedColumn := "state"
+		if options.wrongStateIndex {
+			indexedColumn = "key"
+		}
+		if _, err := db.Exec("CREATE INDEX once_records_state_idx ON once_records(" + indexedColumn + ")"); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+	}
+	if options.metadata {
+		if _, err := db.Exec(`
+CREATE TABLE once_meta (
+	key TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+);
+INSERT INTO once_meta (key, value) VALUES ('schema_version', '1');
+`); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := RestrictLocalFile(path); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func createLegacySQLiteStore(t *testing.T, path string) {

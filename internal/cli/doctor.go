@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -10,7 +11,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	once "github.com/Baagheera/once/internal/once"
@@ -319,34 +319,11 @@ func sqliteReadOnlyDSN(path string) (string, error) {
 	return u.String(), nil
 }
 
-type sqliteColumn struct {
-	typ          string
-	notNull      bool
-	pk           int
-	defaultValue string
-}
-
 func doctorCheckSQLiteSchema(db *sql.DB) doctorCheck {
 	if err := doctorCheckSQLiteSchemaVersion(db); err != nil {
 		return doctorCheck{name: "sqlite schema", level: doctorFail, detail: err.Error()}
 	}
-
-	var tableCount int
-	if err := db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'once_records'").Scan(&tableCount); err != nil {
-		return doctorCheck{name: "sqlite schema", level: doctorFail, detail: err.Error()}
-	}
-	if tableCount != 1 {
-		return doctorCheck{name: "sqlite schema", level: doctorFail, detail: "once_records table is missing"}
-	}
-
-	columns, err := sqliteOnceRecordColumns(db)
-	if err != nil {
-		return doctorCheck{name: "sqlite schema", level: doctorFail, detail: err.Error()}
-	}
-	if detail := doctorSchemaProblem(columns); detail != "" {
-		return doctorCheck{name: "sqlite schema", level: doctorFail, detail: detail}
-	}
-	if err := doctorCheckStateIndex(db); err != nil {
+	if err := once.CheckSQLiteRecordSchema(context.Background(), db); err != nil {
 		return doctorCheck{name: "sqlite schema", level: doctorFail, detail: err.Error()}
 	}
 	return doctorCheck{name: "sqlite schema", level: doctorOK, detail: "once_records table is readable"}
@@ -364,119 +341,10 @@ func doctorCheckSQLiteSchemaVersion(db *sql.DB) error {
 	var version string
 	err := db.QueryRow(`SELECT value FROM once_meta WHERE key = 'schema_version'`).Scan(&version)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil
+		return fmt.Errorf("sqlite metadata table is missing schema_version")
 	}
 	if err != nil {
 		return err
 	}
 	return once.CheckSQLiteSchemaVersion(version)
-}
-
-func doctorSchemaProblem(columns map[string]sqliteColumn) string {
-	required := []struct {
-		name         string
-		typ          string
-		notNull      bool
-		defaultValue string
-	}{
-		{name: "key", typ: "TEXT"},
-		{name: "attempt_hash", typ: "TEXT", notNull: true, defaultValue: "''"},
-		{name: "state", typ: "TEXT", notNull: true},
-		{name: "exit_code", typ: "INTEGER", notNull: true, defaultValue: "0"},
-		{name: "stdout", typ: "BLOB", notNull: true, defaultValue: "X''"},
-		{name: "stderr", typ: "BLOB", notNull: true, defaultValue: "X''"},
-		{name: "error", typ: "TEXT", notNull: true, defaultValue: "''"},
-		{name: "command", typ: "TEXT", notNull: true, defaultValue: "'[]'"},
-		{name: "started_at", typ: "TEXT", notNull: true},
-		{name: "finished_at", typ: "TEXT"},
-		{name: "updated_at", typ: "TEXT", notNull: true},
-	}
-
-	var missing []string
-	for _, want := range required {
-		if _, ok := columns[want.name]; !ok {
-			missing = append(missing, want.name)
-		}
-	}
-	if len(missing) > 0 {
-		sort.Strings(missing)
-		return "once_records missing columns: " + strings.Join(missing, ", ")
-	}
-
-	key := columns["key"]
-	if key.pk != 1 {
-		return "once_records key column is not the primary key"
-	}
-
-	for _, want := range required {
-		got := columns[want.name]
-		if got.typ != want.typ {
-			return fmt.Sprintf("once_records %s column has type %s, want %s", want.name, got.typ, want.typ)
-		}
-		if want.notNull && !got.notNull {
-			return fmt.Sprintf("once_records %s column is nullable", want.name)
-		}
-		if want.defaultValue != "" && normalizeSQLiteDefault(got.defaultValue) != want.defaultValue {
-			return fmt.Sprintf("once_records %s column default is %s, want %s", want.name, printableSQLiteDefault(got.defaultValue), want.defaultValue)
-		}
-	}
-	return ""
-}
-
-func normalizeSQLiteDefault(value string) string {
-	return strings.ToUpper(strings.TrimSpace(value))
-}
-
-func printableSQLiteDefault(value string) string {
-	if strings.TrimSpace(value) == "" {
-		return "<none>"
-	}
-	return strings.TrimSpace(value)
-}
-
-func doctorCheckStateIndex(db *sql.DB) error {
-	var indexCount int
-	err := db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = 'once_records' AND name = 'once_records_state_idx'").Scan(&indexCount)
-	if err != nil {
-		return err
-	}
-	if indexCount != 1 {
-		return fmt.Errorf("once_records_state_idx index is missing")
-	}
-	return nil
-}
-
-func sqliteOnceRecordColumns(db *sql.DB) (map[string]sqliteColumn, error) {
-	rows, err := db.Query("PRAGMA table_info(once_records)")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	columns := map[string]sqliteColumn{}
-	for rows.Next() {
-		var cid int
-		var name string
-		var typ string
-		var notNull int
-		var defaultValue sql.NullString
-		var pk int
-		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
-			return nil, err
-		}
-		var defaultText string
-		if defaultValue.Valid {
-			defaultText = defaultValue.String
-		}
-		columns[name] = sqliteColumn{
-			typ:          strings.ToUpper(typ),
-			notNull:      notNull != 0,
-			pk:           pk,
-			defaultValue: defaultText,
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return columns, nil
 }

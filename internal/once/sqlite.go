@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -28,6 +29,49 @@ const (
 	sqliteMetadataVersionMissing
 	sqliteMetadataVersionPresent
 )
+
+type sqliteRecordSchemaState uint8
+
+const (
+	sqliteRecordSchemaAbsent sqliteRecordSchemaState = iota
+	sqliteRecordSchemaLegacy
+	sqliteRecordSchemaCurrent
+)
+
+// SQLiteSchemaQueryer is the subset of database/sql used to inspect a store's
+// schema. Both *sql.DB and *sql.Conn implement it.
+type SQLiteSchemaQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+type sqliteColumn struct {
+	typ          string
+	notNull      bool
+	pk           int
+	defaultValue string
+}
+
+type sqliteColumnRequirement struct {
+	name         string
+	typ          string
+	notNull      bool
+	defaultValue string
+}
+
+var sqliteRecordColumnRequirements = []sqliteColumnRequirement{
+	{name: "key", typ: "TEXT"},
+	{name: "attempt_hash", typ: "TEXT", notNull: true, defaultValue: "''"},
+	{name: "state", typ: "TEXT", notNull: true},
+	{name: "exit_code", typ: "INTEGER", notNull: true, defaultValue: "0"},
+	{name: "stdout", typ: "BLOB", notNull: true, defaultValue: "X''"},
+	{name: "stderr", typ: "BLOB", notNull: true, defaultValue: "X''"},
+	{name: "error", typ: "TEXT", notNull: true, defaultValue: "''"},
+	{name: "command", typ: "TEXT", notNull: true, defaultValue: "'[]'"},
+	{name: "started_at", typ: "TEXT", notNull: true},
+	{name: "finished_at", typ: "TEXT"},
+	{name: "updated_at", typ: "TEXT", notNull: true},
+}
 
 type sqliteSchemaVersionMissingError struct{}
 
@@ -163,9 +207,15 @@ func (s *SQLiteStore) init(options sqliteInitOptions) error {
 		if err := CheckSQLiteSchemaVersion(version); err != nil {
 			return err
 		}
+		if err := CheckSQLiteRecordSchema(ctx, conn); err != nil {
+			return err
+		}
 		return configureSQLiteConnection(ctx, conn, options.afterWALTransitionContention)
 	}
 
+	if _, err := inspectSQLiteRecordSchema(ctx, conn, true, false); err != nil {
+		return err
+	}
 	if options.afterMissingMetadataRead != nil {
 		options.afterMissingMetadataRead()
 	}
@@ -213,6 +263,9 @@ func (s *SQLiteStore) init(options sqliteInitOptions) error {
 		return errSQLiteSchemaVersionMissing
 	}
 	if err := CheckSQLiteSchemaVersion(version); err != nil {
+		return err
+	}
+	if err := CheckSQLiteRecordSchema(ctx, conn); err != nil {
 		return err
 	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
@@ -788,8 +841,15 @@ func readSQLiteSchemaVersion(ctx context.Context, conn *sql.Conn) (sqliteMetadat
 }
 
 func initializeSQLiteSchema(ctx context.Context, conn *sql.Conn) error {
-	if _, err := conn.ExecContext(ctx, `
-CREATE TABLE IF NOT EXISTS once_records (
+	state, err := inspectSQLiteRecordSchema(ctx, conn, true, false)
+	if err != nil {
+		return err
+	}
+
+	switch state {
+	case sqliteRecordSchemaAbsent:
+		if _, err := conn.ExecContext(ctx, `
+CREATE TABLE once_records (
 	key TEXT PRIMARY KEY,
 	attempt_hash TEXT NOT NULL DEFAULT '',
 	state TEXT NOT NULL CHECK (state IN ('running', 'succeeded', 'failed')),
@@ -802,12 +862,22 @@ CREATE TABLE IF NOT EXISTS once_records (
 	finished_at TEXT,
 	updated_at TEXT NOT NULL
 );
-
-CREATE INDEX IF NOT EXISTS once_records_state_idx ON once_records(state);
 `); err != nil {
+			return err
+		}
+	case sqliteRecordSchemaLegacy:
+		if _, err := conn.ExecContext(ctx, "ALTER TABLE once_records ADD COLUMN attempt_hash TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+	}
+
+	if _, err := inspectSQLiteRecordSchema(ctx, conn, false, false); err != nil {
 		return err
 	}
-	if err := ensureSQLiteColumn(ctx, conn, "once_records", "attempt_hash", "ALTER TABLE once_records ADD COLUMN attempt_hash TEXT NOT NULL DEFAULT ''"); err != nil {
+	if _, err := conn.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS once_records_state_idx ON once_records(state)"); err != nil {
+		return err
+	}
+	if err := checkSQLiteStateIndex(ctx, conn); err != nil {
 		return err
 	}
 	if _, err := conn.ExecContext(ctx, `
@@ -818,44 +888,182 @@ CREATE TABLE IF NOT EXISTS once_meta (
 `); err != nil {
 		return err
 	}
-	_, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO once_meta (key, value) VALUES ('schema_version', ?)`, sqliteSchemaVersion)
+	_, err = conn.ExecContext(ctx, `INSERT OR IGNORE INTO once_meta (key, value) VALUES ('schema_version', ?)`, sqliteSchemaVersion)
 	return err
 }
 
-func ensureSQLiteColumn(ctx context.Context, conn *sql.Conn, table, column, ddl string) error {
-	rows, err := conn.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+// CheckSQLiteRecordSchema validates the current once_records table and its
+// supporting index without modifying the database.
+func CheckSQLiteRecordSchema(ctx context.Context, db SQLiteSchemaQueryer) error {
+	state, err := inspectSQLiteRecordSchema(ctx, db, false, true)
 	if err != nil {
 		return err
 	}
+	if state == sqliteRecordSchemaAbsent {
+		return fmt.Errorf("once_records table is missing")
+	}
+	return nil
+}
 
-	found := false
+func inspectSQLiteRecordSchema(ctx context.Context, db SQLiteSchemaQueryer, allowLegacy, requireStateIndex bool) (sqliteRecordSchemaState, error) {
+	columns, err := sqliteOnceRecordColumns(ctx, db)
+	if err != nil {
+		return 0, err
+	}
+	if len(columns) == 0 {
+		return sqliteRecordSchemaAbsent, nil
+	}
+
+	state := sqliteRecordSchemaCurrent
+	requireAttemptHash := true
+	if _, ok := columns["attempt_hash"]; !ok && allowLegacy {
+		state = sqliteRecordSchemaLegacy
+		requireAttemptHash = false
+	}
+	if detail := sqliteRecordSchemaProblem(columns, requireAttemptHash); detail != "" {
+		return 0, errors.New(detail)
+	}
+	hasStateIndex, err := inspectSQLiteStateIndex(ctx, db)
+	if err != nil {
+		return 0, err
+	}
+	if requireStateIndex && !hasStateIndex {
+		return 0, fmt.Errorf("once_records_state_idx index is missing")
+	}
+	return state, nil
+}
+
+func sqliteOnceRecordColumns(ctx context.Context, db SQLiteSchemaQueryer) (map[string]sqliteColumn, error) {
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info(once_records)")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	columns := map[string]sqliteColumn{}
 	for rows.Next() {
 		var cid int
 		var name string
 		var typ string
 		var notNull int
-		var defaultValue any
+		var defaultValue sql.NullString
 		var pk int
 		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
-			_ = rows.Close()
-			return err
+			return nil, err
 		}
-		if name == column {
-			found = true
+		var defaultText string
+		if defaultValue.Valid {
+			defaultText = defaultValue.String
+		}
+		columns[name] = sqliteColumn{
+			typ:          strings.ToUpper(typ),
+			notNull:      notNull != 0,
+			pk:           pk,
+			defaultValue: defaultText,
 		}
 	}
 	if err := rows.Err(); err != nil {
-		_ = rows.Close()
+		return nil, err
+	}
+	return columns, nil
+}
+
+func sqliteRecordSchemaProblem(columns map[string]sqliteColumn, requireAttemptHash bool) string {
+	required := make(map[string]sqliteColumnRequirement, len(sqliteRecordColumnRequirements))
+	var missing []string
+	for _, want := range sqliteRecordColumnRequirements {
+		if want.name == "attempt_hash" && !requireAttemptHash {
+			continue
+		}
+		required[want.name] = want
+		if _, ok := columns[want.name]; !ok {
+			missing = append(missing, want.name)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return "once_records missing columns: " + strings.Join(missing, ", ")
+	}
+
+	var unsupported []string
+	for name := range columns {
+		if _, ok := required[name]; !ok {
+			unsupported = append(unsupported, name)
+		}
+	}
+	if len(unsupported) > 0 {
+		sort.Strings(unsupported)
+		return "once_records has unsupported columns: " + strings.Join(unsupported, ", ")
+	}
+
+	key := columns["key"]
+	if key.pk != 1 {
+		return "once_records key column is not the primary key"
+	}
+	for name, column := range columns {
+		if name != "key" && column.pk != 0 {
+			return "once_records key column is not the sole primary key"
+		}
+	}
+
+	for _, want := range sqliteRecordColumnRequirements {
+		if want.name == "attempt_hash" && !requireAttemptHash {
+			continue
+		}
+		got := columns[want.name]
+		if got.typ != want.typ {
+			return fmt.Sprintf("once_records %s column has type %s, want %s", want.name, got.typ, want.typ)
+		}
+		if want.notNull && !got.notNull {
+			return fmt.Sprintf("once_records %s column is nullable", want.name)
+		}
+		if want.defaultValue != "" && normalizeSQLiteDefault(got.defaultValue) != want.defaultValue {
+			return fmt.Sprintf("once_records %s column default is %s, want %s", want.name, printableSQLiteDefault(got.defaultValue), want.defaultValue)
+		}
+	}
+	return ""
+}
+
+func normalizeSQLiteDefault(value string) string {
+	return strings.ToUpper(strings.TrimSpace(value))
+}
+
+func printableSQLiteDefault(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "<none>"
+	}
+	return strings.TrimSpace(value)
+}
+
+func checkSQLiteStateIndex(ctx context.Context, db SQLiteSchemaQueryer) error {
+	present, err := inspectSQLiteStateIndex(ctx, db)
+	if err != nil {
 		return err
 	}
-	if err := rows.Close(); err != nil {
-		return err
+	if !present {
+		return fmt.Errorf("once_records_state_idx index is missing")
 	}
-	if found {
-		return nil
+	return nil
+}
+
+func inspectSQLiteStateIndex(ctx context.Context, db SQLiteSchemaQueryer) (bool, error) {
+	var unique, partial, columnCount, stateColumnCount int
+	err := db.QueryRowContext(ctx, `SELECT
+	COALESCE((SELECT "unique" FROM pragma_index_list('once_records') WHERE name = 'once_records_state_idx'), -1),
+	COALESCE((SELECT partial FROM pragma_index_list('once_records') WHERE name = 'once_records_state_idx'), -1),
+	(SELECT count(*) FROM pragma_index_info('once_records_state_idx')),
+	(SELECT count(*) FROM pragma_index_info('once_records_state_idx') WHERE seqno = 0 AND name = 'state')
+`).Scan(&unique, &partial, &columnCount, &stateColumnCount)
+	if err != nil {
+		return false, err
 	}
-	_, err = conn.ExecContext(ctx, ddl)
-	return err
+	if unique == -1 {
+		return false, nil
+	}
+	if unique != 0 || partial != 0 || columnCount != 1 || stateColumnCount != 1 {
+		return false, fmt.Errorf("once_records_state_idx index must index only state")
+	}
+	return true, nil
 }
 
 func configureSQLiteDurability(ctx context.Context, conn *sql.Conn, afterWALTransitionContention func()) error {
