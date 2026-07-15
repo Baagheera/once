@@ -31,18 +31,22 @@ to reconcile externally, forget the key, or leave it alone.
 
 ## Public surfaces
 
-The main public surfaces are the CLI and HTTP API.
+The supported public surfaces are the documented CLI commands, flags, and exit
+semantics, the HTTP `/v1` API, and the exported `oncehttp` API. The package is a
+small wrapper around the HTTP API; it does not expose the SQLite store, run
+commands, or create a second implementation of the idempotency model. Other Go
+packages are internal.
 
-The `oncehttp` package is an experimental convenience wrapper around the HTTP
-API. It does not expose the SQLite store, run commands, or create a second
-implementation of the idempotency model. Other Go packages are internal today.
-That keeps the project free to adjust storage and package boundaries before
-`v1.0.0` without pretending there is a stable storage library API.
+Human-readable diagnostics and tabular command output are operator interfaces,
+not stable machine formats. Integrations should use `export` JSON Lines,
+`doctor --json`, or the HTTP JSON API.
 
-The SQLite file is the durable store, but the schema is not a separately stable
-integration contract before `v1.0.0`. once stores a schema version in
-`once_meta`, initializes metadata for older stores that do not have it, and
-rejects stores that declare an unsupported older or newer schema version.
+The SQLite file is durable user data, but its schema is an internal
+implementation detail rather than a direct integration API. Releases in the v1
+line preserve stores written by earlier v1 releases through compatible schema
+changes or explicit migrations. once records a schema version in `once_meta`
+and rejects a store that it cannot safely interpret. Direct queries and edits
+are unsupported.
 
 ## HTTP server
 

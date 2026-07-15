@@ -2,18 +2,17 @@
 
 ## Supported versions
 
-once is experimental.
+once follows semantic versioning from `v1.0.0`.
 
-Security fixes are applied to `main` and to the latest released minor line when
+Security fixes are applied to `main` and to the latest published release when
 practical.
 
 Currently supported:
 
 - `main`
-- latest `v0.6.x`
+- latest published release
 
-Older experimental releases may be superseded instead of patched. The public API
-and storage format may still change before `v1.0.0`.
+Pre-1.0 releases become unsupported when `v1.0.0` is published.
 
 ## Reporting a vulnerability
 
