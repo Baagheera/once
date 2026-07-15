@@ -458,6 +458,20 @@ func TestOpenSQLiteConcurrentEmptyFirstOpenAcrossProcesses(t *testing.T) {
 	markers := make([]string, openerCount)
 	contentionMarkers := make([]string, openerCount)
 	contentionReleasePaths := make([]string, openerCount)
+	startedChildren := 0
+	childrenFinished := false
+	stopChildren := func() {
+		if childrenFinished {
+			return
+		}
+		cancel()
+		for i := 0; i < startedChildren; i++ {
+			_ = children[i].cmd.Wait()
+		}
+		childrenFinished = true
+	}
+	defer stopChildren()
+
 	for i := range children {
 		markers[i] = filepath.Join(barrierDir, "ready-"+strconv.Itoa(i))
 		contentionMarkers[i] = filepath.Join(barrierDir, "contention-"+strconv.Itoa(i))
@@ -477,20 +491,9 @@ func TestOpenSQLiteConcurrentEmptyFirstOpenAcrossProcesses(t *testing.T) {
 		if err := cmd.Start(); err != nil {
 			t.Fatalf("start opener %d: %v", i+1, err)
 		}
+		startedChildren++
 	}
 
-	childrenFinished := false
-	stopChildren := func() {
-		if childrenFinished {
-			return
-		}
-		cancel()
-		for i := range children {
-			_ = children[i].cmd.Wait()
-		}
-		childrenFinished = true
-	}
-	defer stopChildren()
 	childOutput := func() string {
 		var output strings.Builder
 		for i := range children {
