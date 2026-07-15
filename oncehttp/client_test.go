@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -280,6 +282,92 @@ func TestHTTPErrorIncludesStatusAndMessage(t *testing.T) {
 	}
 }
 
+func TestClientDoesNotFollowCommitRedirect(t *testing.T) {
+	var targetRequests atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetRequests.Add(1)
+		writeTestJSON(t, w, http.StatusOK, Record{Key: "demo", State: Succeeded})
+	}))
+	defer target.Close()
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer origin.Close()
+
+	client, err := New(origin.URL, WithBearerToken("secret-token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Commit(context.Background(), CommitRequest{
+		Key:          "demo",
+		AttemptToken: "attempt-token",
+		State:        Succeeded,
+	})
+	if targetRequests.Load() != 0 {
+		t.Fatalf("redirect target received %d requests, want 0", targetRequests.Load())
+	}
+	assertHTTPStatus(t, err, http.StatusTemporaryRedirect)
+}
+
+func TestClientDoesNotFollowDeleteRedirectWithCustomHTTPClient(t *testing.T) {
+	var targetRequests atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetRequests.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer origin.Close()
+
+	custom := &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error { return nil },
+	}
+	client, err := New(origin.URL, WithHTTPClient(custom))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.Delete(context.Background(), "demo", "attempt-token", true)
+	if targetRequests.Load() != 0 {
+		t.Fatalf("redirect target received %d requests, want 0", targetRequests.Load())
+	}
+	assertHTTPStatus(t, err, http.StatusTemporaryRedirect)
+}
+
+func TestWithHTTPClientUsesConfiguredTransport(t *testing.T) {
+	var requests atomic.Int32
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"key":"demo","state":"succeeded"}`)),
+			Request:    req,
+		}, nil
+	})
+	client, err := New("http://once.invalid", WithHTTPClient(&http.Client{Transport: transport}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Get(context.Background(), "demo"); err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("transport received %d requests, want 1", requests.Load())
+	}
+}
+
+func TestWithHTTPClientRejectsNil(t *testing.T) {
+	client, err := New("http://example.test", WithHTTPClient(nil))
+	if err == nil || client != nil {
+		t.Fatalf("New returned client=%v err=%v, want error", client, err)
+	}
+}
+
 func TestWithBearerTokenTrimsFileWhitespaceAndRejectsInvalidTokens(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer secret-token" {
@@ -319,4 +407,19 @@ func writeTestJSON(t *testing.T, w http.ResponseWriter, status int, value any) {
 	if err := json.NewEncoder(w).Encode(value); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func assertHTTPStatus(t *testing.T, err error, status int) {
+	t.Helper()
+
+	var httpErr *Error
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != status {
+		t.Fatalf("err = %T %v, want HTTP status %d", err, err, status)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }

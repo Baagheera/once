@@ -2,9 +2,13 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1542,6 +1546,97 @@ func TestServeDoesNotCreateTokenFileWhenStorePathIsInvalid(t *testing.T) {
 	}
 	if _, err := os.Stat(tokenFile); !os.IsNotExist(err) {
 		t.Fatalf("token file stat err = %v, want not exist", err)
+	}
+}
+
+func TestServeHTTPUsesListenerAndShutsDownOnCancellation(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+	})
+
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	serveResult := make(chan error, 1)
+	go func() {
+		serveResult <- serveHTTP(ctx, srv, listener)
+	}()
+
+	requestCtx, requestCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer requestCancel()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, "http://"+listener.Addr().String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+
+	cancel()
+	select {
+	case err := <-serveResult:
+		if err != nil {
+			t.Fatalf("serveHTTP error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveHTTP did not stop after cancellation")
+	}
+}
+
+func TestServeHTTPPropagatesServeError(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	err = serveHTTP(context.Background(), &http.Server{}, listener)
+	if err == nil {
+		t.Fatal("serveHTTP error = nil")
+	}
+	if errors.Is(err, http.ErrServerClosed) {
+		t.Fatalf("serveHTTP error = %v, want real listener error", err)
+	}
+}
+
+func TestServeReportsBindErrorBeforeListening(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+	})
+
+	var out, errOut bytes.Buffer
+	code := Run([]string{
+		"--store", filepath.Join(t.TempDir(), "once.db"),
+		"serve", "--listen", listener.Addr().String(), "--unsafe-no-auth",
+	}, &out, &errOut)
+	if code != 1 {
+		t.Fatalf("code = %d stderr = %s", code, errOut.String())
+	}
+	if strings.Contains(out.String(), "listening") {
+		t.Fatalf("stdout reported listening before bind: %q", out.String())
+	}
+	if !strings.Contains(errOut.String(), "once: serve:") {
+		t.Fatalf("stderr = %q", errOut.String())
 	}
 }
 

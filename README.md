@@ -383,7 +383,9 @@ import "github.com/Baagheera/once/oncehttp"
 ```
 
 The client caps successful JSON responses at 16 MiB by default. Use
-`oncehttp.WithMaxResponseBytes` if stored output can be larger.
+`oncehttp.WithMaxResponseBytes` if stored output can be larger. It does not
+follow redirects, so bearer tokens, attempt tokens, and commit bodies stay
+bound to the configured server.
 
 ## Security notes
 
